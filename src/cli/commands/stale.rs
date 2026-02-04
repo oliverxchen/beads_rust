@@ -22,7 +22,7 @@ pub fn execute(args: &StaleArgs, cli: &config::CliOverrides, ctx: &OutputContext
     let storage = &storage_ctx.storage;
 
     let statuses = if args.status.is_empty() {
-        vec![Status::Open, Status::InProgress]
+        vec![Status::Open, Status::InProgress, Status::Review]
     } else {
         parse_statuses(&args.status)?
     };

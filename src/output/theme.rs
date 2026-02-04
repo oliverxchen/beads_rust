@@ -29,6 +29,7 @@ pub struct Theme {
 
     pub status_open: Style,
     pub status_in_progress: Style,
+    pub status_review: Style,
     pub status_blocked: Style,
     pub status_deferred: Style,
     pub status_closed: Style,
@@ -79,6 +80,7 @@ impl Default for Theme {
 
             status_open: Style::new().color(color("green")),
             status_in_progress: Style::new().color(color("yellow")).bold(),
+            status_review: Style::new().color(color("cyan")).bold(),
             status_blocked: Style::new().color(color("red")),
             status_deferred: Style::new().color(color("blue")).dim(),
             status_closed: Style::new().color(color("bright_black")),
@@ -118,6 +120,7 @@ impl Theme {
         match status {
             Status::Open => self.status_open.clone(),
             Status::InProgress => self.status_in_progress.clone(),
+            Status::Review => self.status_review.clone(),
             Status::Blocked => self.status_blocked.clone(),
             Status::Deferred | Status::Draft => self.status_deferred.clone(),
             Status::Closed => self.status_closed.clone(),

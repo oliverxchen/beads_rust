@@ -1251,16 +1251,16 @@ impl SqliteStorage {
     pub fn get_blocked_by_blocks_deps_only(&self) -> Result<HashSet<String>> {
         // Returns issues that:
         // 1. Have a 'blocks' type dependency
-        // 2. Where the blocker is not closed/tombstone
-        // 3. AND the blocked issue itself is not closed/tombstone
+        // 2. Where the blocker is not closed/tombstone/review
+        // 3. AND the blocked issue itself is not closed/tombstone/review
         let mut stmt = self.conn.prepare_cached(
             r"SELECT DISTINCT d.issue_id
               FROM dependencies d
               LEFT JOIN issues blocker ON d.depends_on_id = blocker.id
               LEFT JOIN issues blocked ON d.issue_id = blocked.id
               WHERE d.type = 'blocks'
-                AND blocker.status NOT IN ('closed', 'tombstone')
-                AND blocked.status NOT IN ('closed', 'tombstone')",
+                AND blocker.status NOT IN ('closed', 'tombstone', 'review')
+                AND blocked.status NOT IN ('closed', 'tombstone', 'review')",
         )?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
@@ -1321,10 +1321,10 @@ impl SqliteStorage {
     ///
     /// This computes which issues are blocked based on their dependencies
     /// and the status of their blockers. An issue is blocked if it has a
-    /// blocking-type dependency on an issue that is not closed/tombstone.
+    /// blocking-type dependency on an issue that is not closed/tombstone/review.
     ///
     /// Blocking dependency types: blocks, parent-child, conditional-blocks, waits-for
-    /// Blocking statuses: any non-terminal status (not closed/tombstone)
+    /// Blocking statuses: any non-terminal status (not closed/tombstone/review)
     ///
     /// # Errors
     ///
@@ -1347,7 +1347,7 @@ impl SqliteStorage {
         conn.execute("DELETE FROM blocked_issues_cache", [])?;
 
         // Find all issues that are blocked by a dependency
-        // An issue is blocked if it has a blocking-type dependency on an issue that is not closed/tombstone
+        // An issue is blocked if it has a blocking-type dependency on an issue that is not closed/tombstone/review
         //
         // Note: parent-child is NOT included here. A child is not blocked just because
         // its parent epic is open. However, if the parent is blocked by something else,
@@ -1365,7 +1365,7 @@ impl SqliteStorage {
                   WHERE d.type IN ('blocks', 'conditional-blocks', 'waits-for')
                     AND (
                       -- The blocker is in a blocking state (anything not terminal)
-                      i.status NOT IN ('closed', 'tombstone')
+                      i.status NOT IN ('closed', 'tombstone', 'review')
                       -- Or it's a missing local dependency (orphan)
                       -- External dependencies are resolved at runtime in the CLI
                       OR (i.id IS NULL AND d.depends_on_id NOT LIKE 'external:%')
@@ -3325,7 +3325,7 @@ fn query_external_project_capabilities(
             "SELECT DISTINCT l.label
              FROM labels l
              INNER JOIN issues i ON i.id = l.issue_id
-             WHERE i.status IN ('closed', 'tombstone') AND l.label IN ({})",
+             WHERE i.status IN ('closed', 'tombstone', 'review') AND l.label IN ({})",
             placeholders.join(",")
         );
         let params: Vec<&dyn rusqlite::ToSql> = chunk
@@ -4174,6 +4174,35 @@ mod tests {
         assert_eq!(blocked_issues.len(), 1);
         assert_eq!(blocked_issues[0].0.id, "bd-b2");
         assert_eq!(blocked_issues[0].1.len(), 1);
+    }
+
+    #[test]
+    fn test_review_is_non_blocking() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 4, 2, 0, 0, 0).unwrap();
+
+        let blocker = make_issue("bd-r1", "Reviewed", Status::Review, 1, None, t1, None);
+        let blocked = make_issue(
+            "bd-r2",
+            "Should not be blocked",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&blocker, "tester").unwrap();
+        storage.create_issue(&blocked, "tester").unwrap();
+
+        storage
+            .add_dependency("bd-r2", "bd-r1", "blocks", "tester")
+            .unwrap();
+
+        let blocked_issues = storage.get_blocked_issues().unwrap();
+        assert!(blocked_issues.is_empty());
+
+        let blocked_ids = storage.get_blocked_by_blocks_deps_only().unwrap();
+        assert!(!blocked_ids.contains("bd-r2"));
     }
 
     #[test]

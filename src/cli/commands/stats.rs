@@ -117,6 +117,7 @@ fn compute_summary(
 ) -> Result<StatsSummary> {
     let mut open = 0;
     let mut in_progress = 0;
+    let mut review = 0;
     let mut closed = 0;
     let mut blocked_by_status = 0;
     let mut deferred = 0;
@@ -137,6 +138,7 @@ fn compute_summary(
         match issue.status {
             Status::Open => open += 1,
             Status::InProgress => in_progress += 1,
+            Status::Review => review += 1,
             Status::Closed => {
                 closed += 1;
                 // Calculate lead time for closed issues
@@ -203,6 +205,7 @@ fn compute_summary(
         total_issues: total,
         open_issues: open,
         in_progress_issues: in_progress,
+        review_issues: review,
         closed_issues: closed,
         blocked_issues: blocked,
         deferred_issues: deferred,
@@ -424,6 +427,7 @@ fn print_text_output(output: &Statistics) {
     println!("  Total Issues:           {}", s.total_issues);
     println!("  Open:                   {}", s.open_issues);
     println!("  In Progress:            {}", s.in_progress_issues);
+    println!("  Review:                 {}", s.review_issues);
     println!("  Blocked:                {}", s.blocked_issues);
     println!("  Closed:                 {}", s.closed_issues);
     println!("  Ready to Work:          {}", s.ready_issues);
@@ -600,6 +604,11 @@ fn render_status_bars(content: &mut Text, summary: &StatsSummary, theme: &crate:
             "In Progress",
             summary.in_progress_issues,
             &theme.status_in_progress,
+        ),
+        (
+            "Review",
+            summary.review_issues,
+            &theme.status_review,
         ),
         ("Blocked", summary.blocked_issues, &theme.status_blocked),
         ("Closed", summary.closed_issues, &theme.status_closed),
@@ -814,17 +823,20 @@ mod tests {
         let second_issue = make_issue("t-2", Status::InProgress, IssueType::Task);
         let mut third_issue = make_issue("t-3", Status::Closed, IssueType::Bug);
         third_issue.closed_at = Some(Utc::now());
+        let fourth_issue = make_issue("t-4", Status::Review, IssueType::Task);
 
         storage.create_issue(&first_issue, "tester").unwrap();
         storage.create_issue(&second_issue, "tester").unwrap();
         storage.create_issue(&third_issue, "tester").unwrap();
+        storage.create_issue(&fourth_issue, "tester").unwrap();
 
-        let all_issues = vec![first_issue, second_issue, third_issue];
+        let all_issues = vec![first_issue, second_issue, third_issue, fourth_issue];
         let summary = compute_summary(&storage, &all_issues).unwrap();
 
-        assert_eq!(summary.total_issues, 3);
+        assert_eq!(summary.total_issues, 4);
         assert_eq!(summary.open_issues, 1);
         assert_eq!(summary.in_progress_issues, 1);
+        assert_eq!(summary.review_issues, 1);
         assert_eq!(summary.closed_issues, 1);
     }
 

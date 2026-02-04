@@ -35,6 +35,7 @@ pub enum Status {
     #[default]
     Open,
     InProgress,
+    Review,
     Blocked,
     Deferred,
     Draft,
@@ -53,6 +54,7 @@ impl Status {
         match self {
             Self::Open => "open",
             Self::InProgress => "in_progress",
+            Self::Review => "review",
             Self::Blocked => "blocked",
             Self::Deferred => "deferred",
             Self::Draft => "draft",
@@ -70,7 +72,7 @@ impl Status {
 
     #[must_use]
     pub const fn is_active(&self) -> bool {
-        matches!(self, Self::Open | Self::InProgress)
+        matches!(self, Self::Open | Self::InProgress | Self::Review)
     }
 
     /// Returns true if the issue is in draft state (not yet ready for execution).
@@ -93,6 +95,7 @@ impl FromStr for Status {
         match s.to_lowercase().as_str() {
             "open" => Ok(Self::Open),
             "in_progress" | "inprogress" => Ok(Self::InProgress),
+            "review" | "in_review" | "inreview" | "in-review" => Ok(Self::Review),
             "blocked" => Ok(Self::Blocked),
             "deferred" => Ok(Self::Deferred),
             "draft" => Ok(Self::Draft),
@@ -803,6 +806,15 @@ mod tests {
     }
 
     #[test]
+    fn test_status_from_str_review() {
+        assert_eq!(Status::from_str("review").unwrap(), Status::Review);
+        assert_eq!(Status::from_str("in_review").unwrap(), Status::Review);
+        assert_eq!(Status::from_str("IN_REVIEW").unwrap(), Status::Review);
+        assert_eq!(Status::from_str("inreview").unwrap(), Status::Review);
+        assert_eq!(Status::from_str("in-review").unwrap(), Status::Review);
+    }
+
+    #[test]
     fn test_status_from_str_blocked() {
         assert_eq!(Status::from_str("blocked").unwrap(), Status::Blocked);
         assert_eq!(Status::from_str("BLOCKED").unwrap(), Status::Blocked);
@@ -842,6 +854,7 @@ mod tests {
     fn test_status_display() {
         assert_eq!(Status::Open.to_string(), "open");
         assert_eq!(Status::InProgress.to_string(), "in_progress");
+        assert_eq!(Status::Review.to_string(), "review");
         assert_eq!(Status::Blocked.to_string(), "blocked");
         assert_eq!(Status::Deferred.to_string(), "deferred");
         assert_eq!(Status::Closed.to_string(), "closed");
@@ -856,6 +869,7 @@ mod tests {
         assert!(Status::Tombstone.is_terminal());
         assert!(!Status::Open.is_terminal());
         assert!(!Status::InProgress.is_terminal());
+        assert!(!Status::Review.is_terminal());
         assert!(!Status::Blocked.is_terminal());
         assert!(!Status::Deferred.is_terminal());
         assert!(!Status::Pinned.is_terminal());
@@ -866,6 +880,7 @@ mod tests {
     fn test_status_is_active() {
         assert!(Status::Open.is_active());
         assert!(Status::InProgress.is_active());
+        assert!(Status::Review.is_active());
         assert!(!Status::Blocked.is_active());
         assert!(!Status::Deferred.is_active());
         assert!(!Status::Closed.is_active());
@@ -878,6 +893,7 @@ mod tests {
     fn test_status_as_str() {
         assert_eq!(Status::Open.as_str(), "open");
         assert_eq!(Status::InProgress.as_str(), "in_progress");
+        assert_eq!(Status::Review.as_str(), "review");
         assert_eq!(Status::Blocked.as_str(), "blocked");
         assert_eq!(Status::Deferred.as_str(), "deferred");
         assert_eq!(Status::Closed.as_str(), "closed");

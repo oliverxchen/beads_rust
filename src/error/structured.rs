@@ -405,7 +405,10 @@ impl StructuredError {
         let hint = if let Some(detected) = detect_status_intent(provided) {
             Some(format!("Did you mean --status {detected}?"))
         } else {
-            Some("Valid statuses: open, in_progress, blocked, deferred, closed".to_string())
+            Some(
+                "Valid statuses: open, in_progress, review, blocked, deferred, closed"
+                    .to_string(),
+            )
         };
 
         let context = json!({
@@ -672,6 +675,7 @@ static VALID_STATUSES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
         "open",
         "in_progress",
+        "review",
         "blocked",
         "deferred",
         "closed",
@@ -702,6 +706,9 @@ static STATUS_SYNONYMS: LazyLock<std::collections::HashMap<&'static str, &'stati
             ("working", "in_progress"),
             ("active", "in_progress"),
             ("started", "in_progress"),
+            ("in_review", "review"),
+            ("inreview", "review"),
+            ("in-review", "review"),
             ("new", "open"),
             ("todo", "open"),
             ("pending", "open"),
@@ -991,6 +998,7 @@ mod tests {
     fn test_detect_status_intent() {
         assert_eq!(detect_status_intent("done"), Some("closed"));
         assert_eq!(detect_status_intent("wip"), Some("in_progress"));
+        assert_eq!(detect_status_intent("in_review"), Some("review"));
         assert_eq!(detect_status_intent("OPEN"), Some("open"));
         assert_eq!(detect_status_intent("op"), Some("open")); // Prefix match
         assert_eq!(detect_status_intent("xyz"), None);

@@ -201,6 +201,7 @@ br create "Task" -p P2  # Medium priority
 **Valid statuses:**
 - `open` - Ready for work
 - `in_progress` - Currently being worked on
+- `review` - Waiting for review
 - `blocked` - Waiting on dependencies
 - `deferred` - Postponed
 - `closed` - Completed
@@ -210,6 +211,7 @@ br create "Task" -p P2  # Medium priority
 |-------|---------|
 | done, complete, finished | closed |
 | wip, working, active | in_progress |
+| in_review, inreview, in-review | review |
 | new, todo, pending | open |
 | hold, later, postponed | deferred |
 

@@ -28,6 +28,7 @@ pub struct Theme {
     // Status colors
     pub status_open: Style,
     pub status_in_progress: Style,
+    pub status_review: Style,
     pub status_blocked: Style,
     pub status_deferred: Style,
     pub status_closed: Style,
@@ -76,6 +77,7 @@ impl Theme {
             // Status colors - matching text.rs format_status_label
             status_open: Style::new().color(color("green")),
             status_in_progress: Style::new().color(color("yellow")),
+            status_review: Style::new().color(color("cyan")),
             status_blocked: Style::new().color(color("red")),
             status_deferred: Style::new().color(color("blue")),
             status_closed: Style::new().color(color("bright_black")),
@@ -117,6 +119,7 @@ impl Theme {
         match status {
             Status::Open => &self.status_open,
             Status::InProgress => &self.status_in_progress,
+            Status::Review => &self.status_review,
             Status::Blocked => &self.status_blocked,
             Status::Deferred | Status::Draft => &self.status_deferred,
             Status::Closed | Status::Tombstone => &self.status_closed,
@@ -158,6 +161,7 @@ impl Theme {
         Self {
             status_open: Style::new().color(color("bright_green")),
             status_in_progress: Style::new().color(color("bright_yellow")),
+            status_review: Style::new().color(color("bright_cyan")),
             status_blocked: Style::new().color(color("bright_red")),
             status_deferred: Style::new().color(color("bright_blue")),
             status_closed: Style::new().color(color("bright_black")),
@@ -187,6 +191,7 @@ impl Theme {
         Self {
             status_open: normal.clone(),
             status_in_progress: bold.clone(),
+            status_review: bold.clone(),
             status_blocked: bold.clone(),
             status_deferred: dim.clone(),
             status_closed: dim.clone(),

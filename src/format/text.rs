@@ -1,7 +1,7 @@
 //! Text formatting functions for `beads_rust`.
 //!
 //! Provides plain text (non-ANSI) formatting for terminal output:
-//! - Status icons (○ ◐ ● ❄ ✓ ✗ 📌)
+//! - Status icons (○ ◐ ◕ ● ❄ ✓ ✗ 📌)
 //! - Priority labels (P0-P4)
 //! - Type badges ([bug], [feature], etc.)
 //! - Issue line formatting
@@ -16,6 +16,8 @@ pub mod icons {
     pub const OPEN: &str = "○";
     /// In progress - active work (half-filled).
     pub const IN_PROGRESS: &str = "◐";
+    /// Review - awaiting approval (mostly-filled).
+    pub const IN_REVIEW: &str = "◕";
     /// Blocked - needs attention (filled circle).
     pub const BLOCKED: &str = "●";
     /// Deferred - scheduled for later (snowflake).
@@ -55,6 +57,7 @@ pub const fn format_status_icon(status: &Status) -> &'static str {
     match status {
         Status::Open => icons::OPEN,
         Status::InProgress => icons::IN_PROGRESS,
+        Status::Review => icons::IN_REVIEW,
         Status::Blocked => icons::BLOCKED,
         Status::Deferred | Status::Draft => icons::DEFERRED,
         Status::Closed => icons::CLOSED,
@@ -81,6 +84,7 @@ pub fn format_status_label(status: &Status, use_color: bool) -> String {
     match status {
         Status::Open => label.green().to_string(),
         Status::InProgress => label.yellow().to_string(),
+        Status::Review => label.cyan().to_string(),
         Status::Blocked => label.red().to_string(),
         Status::Deferred | Status::Draft => label.blue().to_string(),
         Status::Closed | Status::Tombstone => label.grey().to_string(),
@@ -100,6 +104,7 @@ pub fn format_status_icon_colored(status: &Status, use_color: bool) -> String {
     match status {
         Status::Open => icon.green().to_string(),
         Status::InProgress => icon.yellow().to_string(),
+        Status::Review => icon.cyan().to_string(),
         Status::Blocked => icon.red().to_string(),
         Status::Deferred | Status::Draft => icon.blue().to_string(),
         Status::Closed | Status::Tombstone => icon.grey().to_string(),
@@ -334,6 +339,7 @@ mod tests {
     fn test_status_icons() {
         assert_eq!(format_status_icon(&Status::Open), "○");
         assert_eq!(format_status_icon(&Status::InProgress), "◐");
+        assert_eq!(format_status_icon(&Status::Review), "◕");
         assert_eq!(format_status_icon(&Status::Blocked), "●");
         assert_eq!(format_status_icon(&Status::Deferred), "❄");
         assert_eq!(format_status_icon(&Status::Closed), "✓");

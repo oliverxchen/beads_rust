@@ -71,6 +71,7 @@ static CONFIG_INDEX: OnceLock<CompletionConfigIndex> = OnceLock::new();
 const STATUS_CANDIDATES: &[(&str, &str)] = &[
     ("open", "Open issue"),
     ("in_progress", "In progress"),
+    ("review", "In review"),
     ("blocked", "Blocked"),
     ("deferred", "Deferred"),
     ("closed", "Closed"),
@@ -82,6 +83,7 @@ const STATUS_WITH_ALL_CANDIDATES: &[(&str, &str)] = &[
     ("all", "All statuses"),
     ("open", "Open issue"),
     ("in_progress", "In progress"),
+    ("review", "In review"),
     ("blocked", "Blocked"),
     ("deferred", "Deferred"),
     ("closed", "Closed"),
@@ -980,7 +982,7 @@ pub struct CreateArgs {
     #[arg(long)]
     pub ephemeral: bool,
 
-    /// Initial status (open, deferred, in_progress, closed)
+    /// Initial status (open, in_progress, review, deferred, closed)
     #[arg(long, short = 's', add = ArgValueCompleter::new(status_completer))]
     pub status: Option<String>,
 

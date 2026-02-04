@@ -1,5 +1,13 @@
 # br - Beads Rust
 
+## Reminder to self
+
+For compile and place in `~/.cargo/bin/br`:
+
+```bash
+cargo install --path . --force
+```
+
 <div align="center">
   <img src="br_illustration.webp" alt="br - Fast, non-invasive issue tracker for git repositories" width="600">
 </div>

@@ -236,7 +236,7 @@ impl BeadsError {
                 Some("Use a priority between 0 (critical) and 4 (backlog)")
             }
             Self::InvalidStatus { .. } => {
-                Some("Valid statuses: open, in_progress, blocked, deferred, closed")
+                Some("Valid statuses: open, in_progress, review, blocked, deferred, closed")
             }
             Self::InvalidType { .. } => Some("Valid types: task, bug, feature, epic, chore"),
             _ => None,
