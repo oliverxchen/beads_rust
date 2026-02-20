@@ -8,7 +8,8 @@
 //! Events are local DB only - never exported to JSONL.
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{Connection, Transaction, params};
+use fsqlite::{Connection, Row};
+use fsqlite_types::SqliteValue;
 
 use crate::error::Result;
 use crate::model::{Event, EventType};
@@ -37,13 +38,13 @@ CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor);
 
 /// Insert an event within a transaction.
 ///
-/// This function should be called within the same transaction as the
-/// mutation that triggered the event. The caller is responsible for
-/// managing the transaction.
+/// This function should be called within the same transaction (BEGIN/COMMIT)
+/// as the mutation that triggered the event. The caller is responsible for
+/// managing the transaction boundaries on the connection.
 ///
 /// # Arguments
 ///
-/// * `tx` - Active database transaction
+/// * `conn` - Database connection (with an active transaction)
 /// * `issue_id` - ID of the issue the event pertains to
 /// * `event_type` - Type of event being recorded
 /// * `actor` - Username or identifier of the person/agent making the change
@@ -55,7 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_events_actor ON events(actor);
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     event_type: &EventType,
     actor: &str,
@@ -64,23 +65,34 @@ pub fn insert_event(
     comment: Option<&str>,
 ) -> Result<i64> {
     let now = Utc::now();
-    tx.execute(
+    conn.execute_with_params(
         r"
         INSERT INTO events (issue_id, event_type, actor, old_value, new_value, comment, created_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ",
-        params![
-            issue_id,
-            event_type.as_str(),
-            actor,
-            old_value,
-            new_value,
-            comment,
-            now.to_rfc3339(),
+        &[
+            SqliteValue::from(issue_id),
+            SqliteValue::from(event_type.as_str()),
+            SqliteValue::from(actor),
+            match old_value {
+                Some(v) => SqliteValue::from(v),
+                None => SqliteValue::Null,
+            },
+            match new_value {
+                Some(v) => SqliteValue::from(v),
+                None => SqliteValue::Null,
+            },
+            match comment {
+                Some(v) => SqliteValue::from(v),
+                None => SqliteValue::Null,
+            },
+            SqliteValue::from(now.to_rfc3339()),
         ],
     )?;
 
-    Ok(tx.last_insert_rowid())
+    let row = conn.query_row("SELECT last_insert_rowid()")?;
+    let id = row.get(0).and_then(|v| v.as_integer()).unwrap_or(0);
+    Ok(id)
 }
 
 /// Insert a "created" event for a new issue.
@@ -88,8 +100,8 @@ pub fn insert_event(
 /// # Errors
 ///
 /// Returns an error if the database insert fails.
-pub fn insert_created_event(tx: &Transaction<'_>, issue_id: &str, actor: &str) -> Result<i64> {
-    insert_event(tx, issue_id, &EventType::Created, actor, None, None, None)
+pub fn insert_created_event(conn: &Connection, issue_id: &str, actor: &str) -> Result<i64> {
+    insert_event(conn, issue_id, &EventType::Created, actor, None, None, None)
 }
 
 /// Insert an "updated" event for a field change.
@@ -98,7 +110,7 @@ pub fn insert_created_event(tx: &Transaction<'_>, issue_id: &str, actor: &str) -
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_updated_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     field: &str,
@@ -107,7 +119,7 @@ pub fn insert_updated_event(
 ) -> Result<i64> {
     let comment = Some(format!("Updated field: {field}"));
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::Updated,
         actor,
@@ -123,14 +135,14 @@ pub fn insert_updated_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_status_changed_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     old_status: &str,
     new_status: &str,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::StatusChanged,
         actor,
@@ -146,13 +158,13 @@ pub fn insert_status_changed_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_closed_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     close_reason: Option<&str>,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::Closed,
         actor,
@@ -168,13 +180,13 @@ pub fn insert_closed_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_reopened_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     reason: Option<&str>,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::Reopened,
         actor,
@@ -190,13 +202,13 @@ pub fn insert_reopened_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_commented_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     comment_text: &str,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::Commented,
         actor,
@@ -212,7 +224,7 @@ pub fn insert_commented_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_dependency_added_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     dep_type: &str,
@@ -220,7 +232,7 @@ pub fn insert_dependency_added_event(
 ) -> Result<i64> {
     let comment = format!("Added dependency on {depends_on_id} ({dep_type})");
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::DependencyAdded,
         actor,
@@ -236,14 +248,14 @@ pub fn insert_dependency_added_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_dependency_removed_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     depends_on_id: &str,
 ) -> Result<i64> {
     let comment = format!("Removed dependency on {depends_on_id}");
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::DependencyRemoved,
         actor,
@@ -259,13 +271,13 @@ pub fn insert_dependency_removed_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_label_added_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     label: &str,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::LabelAdded,
         actor,
@@ -281,13 +293,13 @@ pub fn insert_label_added_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_label_removed_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     label: &str,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::LabelRemoved,
         actor,
@@ -303,13 +315,13 @@ pub fn insert_label_removed_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_deleted_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     delete_reason: Option<&str>,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::Deleted,
         actor,
@@ -325,13 +337,13 @@ pub fn insert_deleted_event(
 ///
 /// Returns an error if the database insert fails.
 pub fn insert_restored_event(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     issue_id: &str,
     actor: &str,
     reason: Option<&str>,
 ) -> Result<i64> {
     insert_event(
-        tx,
+        conn,
         issue_id,
         &EventType::Restored,
         actor,
@@ -353,52 +365,52 @@ pub fn insert_restored_event(
 ///
 /// Returns an error if the database query fails.
 pub fn get_events(conn: &Connection, issue_id: &str, limit: usize) -> Result<Vec<Event>> {
-    let query = if limit > 0 {
-        r"
+    let events = if limit > 0 {
+        conn.query_with_params(
+            r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
             LIMIT ?2
-            "
+            ",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(limit as i64),
+            ],
+        )?
     } else {
-        r"
+        conn.query_with_params(
+            r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             WHERE issue_id = ?1
             ORDER BY created_at DESC, id DESC
-            "
+            ",
+            &[SqliteValue::from(issue_id)],
+        )?
     };
 
-    let mut stmt = conn.prepare(query)?;
-    let events: Vec<Event> = if limit > 0 {
-        stmt.query_map(params![issue_id, limit], event_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        stmt.query_map(params![issue_id], event_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    Ok(events)
+    Ok(events.iter().map(event_from_row).collect())
 }
 
-fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
-    let id: i64 = row.get(0)?;
-    let issue_id: String = row.get(1)?;
-    let event_type_str: String = row.get(2)?;
-    let actor: String = row.get(3)?;
-    let old_value: Option<String> = row.get(4)?;
-    let new_value: Option<String> = row.get(5)?;
-    let comment: Option<String> = row.get(6)?;
-    let created_at_str: String = row.get(7)?;
+fn event_from_row(row: &Row) -> Event {
+    let id = row.get(0).and_then(|v| v.as_integer()).unwrap_or(0);
+    let issue_id = row.get(1).and_then(|v| v.as_text()).unwrap_or("").to_string();
+    let event_type_str = row.get(2).and_then(|v| v.as_text()).unwrap_or("");
+    let actor = row.get(3).and_then(|v| v.as_text()).unwrap_or("").to_string();
+    let old_value = row.get(4).and_then(|v| v.as_text()).map(String::from);
+    let new_value = row.get(5).and_then(|v| v.as_text()).map(String::from);
+    let comment = row.get(6).and_then(|v| v.as_text()).map(String::from);
+    let created_at_str = row.get(7).and_then(|v| v.as_text()).unwrap_or("");
 
     // Parse event type
-    let event_type = parse_event_type(&event_type_str);
+    let event_type = parse_event_type(event_type_str);
 
     // Parse timestamp (support RFC3339 and SQLite default format)
-    let created_at = parse_event_timestamp(&created_at_str);
+    let created_at = parse_event_timestamp(created_at_str);
 
-    Ok(Event {
+    Event {
         id,
         issue_id,
         event_type,
@@ -407,7 +419,7 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<Event> {
         new_value,
         comment,
         created_at,
-    })
+    }
 }
 
 fn parse_event_timestamp(value: &str) -> DateTime<Utc> {
@@ -430,31 +442,27 @@ fn parse_event_timestamp(value: &str) -> DateTime<Utc> {
 ///
 /// Returns an error if the database query fails.
 pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
-    let query = if limit > 0 {
-        r"
+    let rows = if limit > 0 {
+        conn.query_with_params(
+            r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
             LIMIT ?1
-            "
+            ",
+            &[SqliteValue::from(limit as i64)],
+        )?
     } else {
-        r"
+        conn.query(
+            r"
             SELECT id, issue_id, event_type, actor, old_value, new_value, comment, created_at
             FROM events
             ORDER BY created_at DESC, id DESC
-            "
+            ",
+        )?
     };
 
-    let mut stmt = conn.prepare(query)?;
-    let events: Vec<Event> = if limit > 0 {
-        stmt.query_map(params![limit], event_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        stmt.query_map([], event_from_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    Ok(events)
+    Ok(rows.iter().map(event_from_row).collect())
 }
 
 /// Get event count for an issue.
@@ -463,11 +471,11 @@ pub fn get_all_events(conn: &Connection, limit: usize) -> Result<Vec<Event>> {
 ///
 /// Returns an error if the database query fails.
 pub fn count_events(conn: &Connection, issue_id: &str) -> Result<i64> {
-    let count: i64 = conn.query_row(
+    let row = conn.query_row_with_params(
         "SELECT COUNT(*) FROM events WHERE issue_id = ?1",
-        params![issue_id],
-        |row| row.get(0),
+        &[SqliteValue::from(issue_id)],
     )?;
+    let count = row.get(0).and_then(|v| v.as_integer()).unwrap_or(0);
     Ok(count)
 }
 
@@ -499,20 +507,22 @@ fn parse_event_type(s: &str) -> EventType {
 ///
 /// Returns an error if table creation fails.
 pub fn init_events_table(conn: &Connection) -> Result<()> {
-    conn.execute_batch(EVENTS_TABLE_SCHEMA)?;
+    super::schema::execute_batch(conn, EVENTS_TABLE_SCHEMA)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use crate::storage::schema::execute_batch;
+    use fsqlite::Connection;
 
     fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("Failed to create in-memory database");
+        let conn = Connection::open(":memory:").expect("Failed to create in-memory database");
 
         // Create minimal issues table for foreign key
-        conn.execute_batch(
+        execute_batch(
+            &conn,
             r"
             CREATE TABLE issues (
                 id TEXT PRIMARY KEY,
@@ -529,7 +539,6 @@ mod tests {
         // Insert a test issue
         conn.execute(
             "INSERT INTO issues (id, title) VALUES ('test-001', 'Test Issue')",
-            [],
         )
         .expect("Failed to insert test issue");
 
@@ -539,10 +548,10 @@ mod tests {
     #[test]
     fn test_insert_created_event() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        let id = insert_created_event(&tx, "test-001", "alice").expect("Failed to insert event");
-        tx.commit().expect("Failed to commit");
+        let id = insert_created_event(&conn, "test-001", "alice").expect("Failed to insert event");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         assert!(id > 0);
 
@@ -555,11 +564,11 @@ mod tests {
     #[test]
     fn test_insert_status_changed_event() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        insert_status_changed_event(&tx, "test-001", "bob", "open", "in_progress")
+        insert_status_changed_event(&conn, "test-001", "bob", "open", "in_progress")
             .expect("Failed to insert event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 1);
@@ -571,11 +580,11 @@ mod tests {
     #[test]
     fn test_insert_closed_event() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        insert_closed_event(&tx, "test-001", "carol", Some("Completed the work"))
+        insert_closed_event(&conn, "test-001", "carol", Some("Completed the work"))
             .expect("Failed to insert event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 1);
@@ -586,11 +595,11 @@ mod tests {
     #[test]
     fn test_insert_commented_event() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        insert_commented_event(&tx, "test-001", "dave", "This is a comment")
+        insert_commented_event(&conn, "test-001", "dave", "This is a comment")
             .expect("Failed to insert event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 1);
@@ -605,14 +614,13 @@ mod tests {
         // Add second issue for dependency
         conn.execute(
             "INSERT INTO issues (id, title) VALUES ('test-002', 'Blocking Issue')",
-            [],
         )
         .expect("Failed to insert second issue");
 
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_dependency_added_event(&tx, "test-001", "eve", "blocks", "test-002")
+        conn.execute("BEGIN").expect("Failed to start tx");
+        insert_dependency_added_event(&conn, "test-001", "eve", "blocks", "test-002")
             .expect("Failed to insert event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 1);
@@ -624,13 +632,13 @@ mod tests {
     #[test]
     fn test_insert_label_events() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        insert_label_added_event(&tx, "test-001", "frank", "urgent")
+        insert_label_added_event(&conn, "test-001", "frank", "urgent")
             .expect("Failed to insert label added event");
-        insert_label_removed_event(&tx, "test-001", "frank", "urgent")
+        insert_label_removed_event(&conn, "test-001", "frank", "urgent")
             .expect("Failed to insert label removed event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 2);
@@ -649,10 +657,10 @@ mod tests {
 
         // Insert multiple events
         for i in 0..5 {
-            let tx = conn.unchecked_transaction().expect("Failed to start tx");
-            insert_commented_event(&tx, "test-001", "user", &format!("Comment {i}"))
+            conn.execute("BEGIN").expect("Failed to start tx");
+            insert_commented_event(&conn, "test-001", "user", &format!("Comment {i}"))
                 .expect("Failed to insert event");
-            tx.commit().expect("Failed to commit");
+            conn.execute("COMMIT").expect("Failed to commit");
         }
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
@@ -669,10 +677,10 @@ mod tests {
 
         // Insert 10 events
         for i in 0..10 {
-            let tx = conn.unchecked_transaction().expect("Failed to start tx");
-            insert_commented_event(&tx, "test-001", "user", &format!("Comment {i}"))
+            conn.execute("BEGIN").expect("Failed to start tx");
+            insert_commented_event(&conn, "test-001", "user", &format!("Comment {i}"))
                 .expect("Failed to insert event");
-            tx.commit().expect("Failed to commit");
+            conn.execute("COMMIT").expect("Failed to commit");
         }
 
         // Get only 3 events
@@ -690,10 +698,10 @@ mod tests {
 
         // Insert events
         for _ in 0..5 {
-            let tx = conn.unchecked_transaction().expect("Failed to start tx");
-            insert_commented_event(&tx, "test-001", "user", "A comment")
+            conn.execute("BEGIN").expect("Failed to start tx");
+            insert_commented_event(&conn, "test-001", "user", "A comment")
                 .expect("Failed to insert event");
-            tx.commit().expect("Failed to commit");
+            conn.execute("COMMIT").expect("Failed to commit");
         }
 
         let count = count_events(&conn, "test-001").expect("Failed to count events");
@@ -703,13 +711,13 @@ mod tests {
     #[test]
     fn test_deleted_and_restored_events() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        insert_deleted_event(&tx, "test-001", "admin", Some("Duplicate issue"))
+        insert_deleted_event(&conn, "test-001", "admin", Some("Duplicate issue"))
             .expect("Failed to insert deleted event");
-        insert_restored_event(&tx, "test-001", "admin", Some("Not a duplicate"))
+        insert_restored_event(&conn, "test-001", "admin", Some("Not a duplicate"))
             .expect("Failed to insert restored event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 2);
@@ -725,11 +733,11 @@ mod tests {
     #[test]
     fn test_reopened_event() {
         let conn = setup_test_db();
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
+        conn.execute("BEGIN").expect("Failed to start tx");
 
-        insert_reopened_event(&tx, "test-001", "manager", Some("Need more work"))
+        insert_reopened_event(&conn, "test-001", "manager", Some("Need more work"))
             .expect("Failed to insert reopened event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 1);
@@ -744,15 +752,14 @@ mod tests {
         // Add second issue
         conn.execute(
             "INSERT INTO issues (id, title) VALUES ('test-002', 'Second Issue')",
-            [],
         )
         .expect("Failed to insert second issue");
 
         // Insert events for both issues
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_created_event(&tx, "test-001", "alice").expect("Failed to insert event");
-        insert_created_event(&tx, "test-002", "bob").expect("Failed to insert event");
-        tx.commit().expect("Failed to commit");
+        conn.execute("BEGIN").expect("Failed to start tx");
+        insert_created_event(&conn, "test-001", "alice").expect("Failed to insert event");
+        insert_created_event(&conn, "test-002", "bob").expect("Failed to insert event");
+        conn.execute("COMMIT").expect("Failed to commit");
 
         let all_events = get_all_events(&conn, 0).expect("Failed to get all events");
         assert_eq!(all_events.len(), 2);
@@ -763,22 +770,22 @@ mod tests {
         let conn = setup_test_db();
 
         // Simulate a typical issue lifecycle
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_created_event(&tx, "test-001", "alice").expect("Created");
-        tx.commit().expect("Commit");
+        conn.execute("BEGIN").expect("Failed to start tx");
+        insert_created_event(&conn, "test-001", "alice").expect("Created");
+        conn.execute("COMMIT").expect("Commit");
 
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_status_changed_event(&tx, "test-001", "alice", "open", "in_progress")
+        conn.execute("BEGIN").expect("Failed to start tx");
+        insert_status_changed_event(&conn, "test-001", "alice", "open", "in_progress")
             .expect("Status change");
-        tx.commit().expect("Commit");
+        conn.execute("COMMIT").expect("Commit");
 
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_commented_event(&tx, "test-001", "bob", "Working on this").expect("Comment");
-        tx.commit().expect("Commit");
+        conn.execute("BEGIN").expect("Failed to start tx");
+        insert_commented_event(&conn, "test-001", "bob", "Working on this").expect("Comment");
+        conn.execute("COMMIT").expect("Commit");
 
-        let tx = conn.unchecked_transaction().expect("Failed to start tx");
-        insert_closed_event(&tx, "test-001", "alice", Some("Done")).expect("Closed");
-        tx.commit().expect("Commit");
+        conn.execute("BEGIN").expect("Failed to start tx");
+        insert_closed_event(&conn, "test-001", "alice", Some("Done")).expect("Closed");
+        conn.execute("COMMIT").expect("Commit");
 
         let events = get_events(&conn, "test-001", 0).expect("Failed to get events");
         assert_eq!(events.len(), 4);
