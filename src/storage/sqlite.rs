@@ -1244,19 +1244,20 @@ impl SqliteStorage {
         // Filter by parent (--parent flag)
         if let Some(ref parent_id) = filters.parent {
             if filters.recursive {
-                sql.push_str(
-                    " AND id IN (
-                        WITH RECURSIVE descendants AS (
-                            SELECT issue_id FROM dependencies
-                            WHERE depends_on_id = ? AND type = 'parent-child'
-                            UNION
-                            SELECT d.issue_id FROM dependencies d
-                            INNER JOIN descendants desc ON d.depends_on_id = desc.issue_id
-                            WHERE d.type = 'parent-child'
-                        )
-                        SELECT issue_id FROM descendants
-                    )",
-                );
+                // Collect all descendants via Rust-side BFS instead of
+                // WITH RECURSIVE (not yet supported in fsqlite subqueries).
+                let descendant_ids = self.collect_descendant_ids(parent_id)?;
+                if descendant_ids.is_empty() {
+                    // No descendants — short-circuit to empty result.
+                    sql.push_str(" AND 1 = 0");
+                } else {
+                    let placeholders: Vec<String> =
+                        descendant_ids.iter().map(|_| "?".to_string()).collect();
+                    let _ = write!(sql, " AND id IN ({})", placeholders.join(","));
+                    for id in &descendant_ids {
+                        params.push(SqliteValue::from(id.as_str()));
+                    }
+                }
             } else {
                 sql.push_str(
                     " AND id IN (
@@ -1264,8 +1265,8 @@ impl SqliteStorage {
                         WHERE depends_on_id = ? AND type = 'parent-child'
                     )",
                 );
+                params.push(SqliteValue::from(parent_id.as_str()));
             }
-            params.push(SqliteValue::from(parent_id.as_str()));
         }
 
         // Sorting
@@ -2550,7 +2551,7 @@ impl SqliteStorage {
         issue_id: &str,
     ) -> Result<Vec<IssueWithDependencyMetadata>> {
         let rows = self.conn.query_with_params(
-            "SELECT d.issue_id, i.title, i.status, i.priority, d.type
+            "SELECT d.issue_id, i.title, i.status, i.priority, d.type, i.created_at
              FROM dependencies d
              LEFT JOIN issues i ON d.issue_id = i.id
              WHERE d.depends_on_id = ?
@@ -2600,6 +2601,33 @@ impl SqliteStorage {
             Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Collect all descendant issue IDs via BFS through parent-child edges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a database query fails.
+    fn collect_descendant_ids(&self, parent_id: &str) -> Result<Vec<String>> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(parent_id.to_string());
+        while let Some(pid) = queue.pop_front() {
+            let rows = self.conn.query_with_params(
+                "SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND type = 'parent-child'",
+                &[SqliteValue::from(pid.as_str())],
+            )?;
+            for row in &rows {
+                if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
+                    let id = id.to_string();
+                    if !result.contains(&id) {
+                        queue.push_back(id.clone());
+                        result.push(id);
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Get IDs of issues that depend on this one.
