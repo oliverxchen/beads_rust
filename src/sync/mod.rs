@@ -1581,6 +1581,11 @@ pub fn export_to_writer_with_policy<W: Write>(
         } else {
             issue.labels.clear();
         }
+        // Normalize labels for consistent round-trip hashing (matches import behavior)
+        if !issue.labels.is_empty() {
+            issue.labels.sort();
+            issue.labels.dedup();
+        }
         if let Some(comments) = all_comments.as_ref().and_then(|map| map.get(&issue.id)) {
             issue.comments = comments.clone();
         } else {
@@ -2080,6 +2085,16 @@ fn normalize_issue(issue: &mut Issue) {
     ) {
         issue.closed_at = None;
     }
+
+    // Normalize external_ref: empty string should be None to prevent UNIQUE constraint violations
+    if let Some(ext_ref) = &issue.external_ref {
+        if ext_ref.trim().is_empty() {
+            issue.external_ref = None;
+        } else {
+            // Re-assign trimmed version just in case
+            issue.external_ref = Some(ext_ref.trim().to_string());
+        }
+    }
 }
 
 /// Import issues from a JSONL file.
@@ -2257,6 +2272,12 @@ pub fn import_from_jsonl(
                             dep.issue_id = new_source.clone();
                         }
                     }
+                    // Update comments
+                    for comment in &mut issue.comments {
+                        if let Some(new_source) = renames.get(&comment.issue_id) {
+                            comment.issue_id = new_source.clone();
+                        }
+                    }
                 }
             }
 
@@ -2350,6 +2371,13 @@ pub fn import_from_jsonl(
                 }
                 if let Some(new_source) = renames.get(&dep.issue_id) {
                     dep.issue_id = new_source.clone();
+                }
+            }
+
+            // Remap comments to point to the resolved ID
+            for comment in &mut issue.comments {
+                if let Some(new_source) = renames.get(&comment.issue_id) {
+                    comment.issue_id = new_source.clone();
                 }
             }
         }
