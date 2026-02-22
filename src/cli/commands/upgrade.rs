@@ -237,6 +237,22 @@ fn execute_upgrade(args: &UpgradeArgs, current_version: &str, ctx: &OutputContex
     Ok(())
 }
 
+/// Map the Rust target triple to the asset name fragment used in GitHub releases.
+///
+/// Release assets follow the pattern `br-v{VERSION}-{platform}_{arch}.tar.gz`
+/// (e.g. `darwin_amd64`, `linux_arm64`), which differs from the Rust target
+/// triple that `self_update` uses by default (e.g. `x86_64-apple-darwin`).
+fn asset_target_name() -> &'static str {
+    match self_update::get_target() {
+        "x86_64-apple-darwin" => "darwin_amd64",
+        "aarch64-apple-darwin" => "darwin_arm64",
+        "x86_64-unknown-linux-gnu" | "x86_64-unknown-linux-musl" => "linux_amd64",
+        "aarch64-unknown-linux-gnu" | "aarch64-unknown-linux-musl" => "linux_arm64",
+        "x86_64-pc-windows-msvc" | "x86_64-pc-windows-gnu" => "windows_amd64",
+        other => other, // fall back to the raw triple for unknown targets
+    }
+}
+
 /// Build the self-update updater.
 fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
     let public_key = *include_bytes!("../../release_public_key.bin");
@@ -244,6 +260,7 @@ fn build_updater(current_version: &str) -> Result<Box<dyn ReleaseUpdate>> {
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
+        .target(asset_target_name())
         .show_download_progress(true)
         .current_version(current_version)
         .verifying_keys(vec![public_key])
@@ -262,6 +279,7 @@ fn build_updater_with_target(
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
+        .target(asset_target_name())
         .show_download_progress(show_progress)
         .current_version(current_version)
         .target_version_tag(target_version)
