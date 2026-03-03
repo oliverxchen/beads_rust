@@ -445,7 +445,7 @@ impl SqliteStorage {
     ) -> Result<bool> {
         // Construct filter clause
         let type_filter = if blocking_only {
-            "AND type IN ('blocks', 'parent-child', 'conditional-blocks')"
+            "AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
         } else {
             "" // No filter, follow all edges
         };
@@ -1463,7 +1463,10 @@ impl SqliteStorage {
         if !force_rebuild {
             return Ok(0);
         }
-        self.conn.execute("BEGIN")?;
+        // Use BEGIN IMMEDIATE to acquire a write lock upfront, matching
+        // the convention used by mutate() and preventing lock-escalation
+        // failures when the first DML statement tries to upgrade.
+        self.conn.execute("BEGIN IMMEDIATE")?;
         match Self::rebuild_blocked_cache_impl(&self.conn) {
             Ok(count) => {
                 self.conn.execute("COMMIT")?;
@@ -1962,19 +1965,21 @@ impl SqliteStorage {
         dep_type: &str,
         actor: &str,
     ) -> Result<bool> {
-        // Check for cycles if this is a blocking dependency
-        if let Ok(dt) = dep_type.parse::<DependencyType>()
-            && dt.is_blocking()
-            && self.would_create_cycle(issue_id, depends_on_id, true)?
-        {
-            return Err(BeadsError::DependencyCycle {
-                path: format!(
-                    "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
-                ),
-            });
-        }
-
         self.mutate("add_dependency", actor, |conn, ctx| {
+            // Cycle check runs INSIDE the transaction (BEGIN IMMEDIATE) to
+            // prevent TOCTOU races where a concurrent writer could insert an
+            // edge between our check and our INSERT.
+            if let Ok(dt) = dep_type.parse::<DependencyType>()
+                && dt.is_blocking()
+                && Self::check_cycle(conn, issue_id, depends_on_id, true)?
+            {
+                return Err(BeadsError::DependencyCycle {
+                    path: format!(
+                        "Adding dependency {issue_id} -> {depends_on_id} would create a cycle"
+                    ),
+                });
+            }
+
             let row = conn.query_row_with_params(
                 "SELECT count(*) FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
                 &[
@@ -2703,6 +2708,9 @@ impl SqliteStorage {
     /// Returns an error if a database query fails.
     fn collect_descendant_ids(&self, parent_id: &str) -> Result<Vec<String>> {
         let mut result = Vec::new();
+        // Use a HashSet for O(1) visited-set lookups instead of the
+        // previous Vec::contains() which was O(n) per check (O(n^2) total).
+        let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(parent_id.to_string());
         while let Some(pid) = queue.pop_front() {
@@ -2713,7 +2721,7 @@ impl SqliteStorage {
             for row in &rows {
                 if let Some(id) = row.get(0).and_then(SqliteValue::as_text) {
                     let id = id.to_string();
-                    if !result.contains(&id) {
+                    if visited.insert(id.clone()) {
                         queue.push_back(id.clone());
                         result.push(id);
                     }
@@ -2964,15 +2972,29 @@ impl SqliteStorage {
     pub fn set_config(&mut self, key: &str, value: &str) -> Result<()> {
         // Explicit DELETE + INSERT instead of ON CONFLICT because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        self.conn.execute_with_params(
-            "DELETE FROM config WHERE key = ?",
-            &[SqliteValue::from(key)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO config (key, value) VALUES (?, ?)",
-            &[SqliteValue::from(key), SqliteValue::from(value)],
-        )?;
-        Ok(())
+        // Wrapped in BEGIN IMMEDIATE to make the pair atomic and prevent
+        // a crash between DELETE and INSERT from losing the value.
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        match (|| -> Result<()> {
+            self.conn.execute_with_params(
+                "DELETE FROM config WHERE key = ?",
+                &[SqliteValue::from(key)],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO config (key, value) VALUES (?, ?)",
+                &[SqliteValue::from(key), SqliteValue::from(value)],
+            )?;
+            Ok(())
+        })() {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Delete a config value.
@@ -3230,19 +3252,32 @@ impl SqliteStorage {
     pub fn set_export_hash(&mut self, issue_id: &str, content_hash: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
-        self.conn.execute_with_params(
-            "DELETE FROM export_hashes WHERE issue_id = ?",
-            &[SqliteValue::from(issue_id)],
-        )?;
-        self.conn.execute_with_params(
-            "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-            &[
-                SqliteValue::from(issue_id),
-                SqliteValue::from(content_hash),
-                SqliteValue::from(now),
-            ],
-        )?;
-        Ok(())
+        // Wrapped in BEGIN IMMEDIATE to make the pair atomic.
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        match (|| -> Result<()> {
+            self.conn.execute_with_params(
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id)],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(content_hash),
+                    SqliteValue::from(now),
+                ],
+            )?;
+            Ok(())
+        })() {
+            Ok(()) => {
+                self.conn.execute("COMMIT")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     /// Batch set export hashes for multiple issues after successful export.
@@ -3257,24 +3292,38 @@ impl SqliteStorage {
             return Ok(0);
         }
         let now = Utc::now().to_rfc3339();
-        let mut count = 0;
-        for (issue_id, content_hash) in exports {
-            // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
-            self.conn.execute_with_params(
-                "DELETE FROM export_hashes WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id.as_str())],
-            )?;
-            self.conn.execute_with_params(
-                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
-                &[
-                    SqliteValue::from(issue_id.as_str()),
-                    SqliteValue::from(content_hash.as_str()),
-                    SqliteValue::from(now.as_str()),
-                ],
-            )?;
-            count += 1;
+        // Wrap the entire batch in a single transaction for atomicity and
+        // performance (avoids per-row journal sync on bulk imports).
+        self.conn.execute("BEGIN IMMEDIATE")?;
+        match (|| -> Result<usize> {
+            let mut count = 0;
+            for (issue_id, content_hash) in exports {
+                // DELETE + INSERT instead of INSERT OR REPLACE (fsqlite UNIQUE limitation)
+                self.conn.execute_with_params(
+                    "DELETE FROM export_hashes WHERE issue_id = ?",
+                    &[SqliteValue::from(issue_id.as_str())],
+                )?;
+                self.conn.execute_with_params(
+                    "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                    &[
+                        SqliteValue::from(issue_id.as_str()),
+                        SqliteValue::from(content_hash.as_str()),
+                        SqliteValue::from(now.as_str()),
+                    ],
+                )?;
+                count += 1;
+            }
+            Ok(count)
+        })() {
+            Ok(count) => {
+                self.conn.execute("COMMIT")?;
+                Ok(count)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK");
+                Err(e)
+            }
         }
-        Ok(count)
     }
 
     /// Clear all export hashes.

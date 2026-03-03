@@ -173,6 +173,11 @@ fn dep_add(
 
     let added = storage.add_dependency(&issue_id, &depends_on_id, dep_type.as_str(), actor)?;
 
+    // Refresh blocked-issues cache so `br ready` reflects the new dependency
+    if added {
+        storage.rebuild_blocked_cache(true)?;
+    }
+
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
             status: if added { "ok" } else { "exists" }.to_string(),
@@ -240,6 +245,11 @@ fn dep_remove(
     };
 
     let removed = storage.remove_dependency(&issue_id, &depends_on_id, actor)?;
+
+    // Refresh blocked-issues cache so `br ready` reflects the removed dependency
+    if removed {
+        storage.rebuild_blocked_cache(true)?;
+    }
 
     if ctx.is_json() || ctx.is_toon() {
         let result = DepActionResult {
