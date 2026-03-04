@@ -756,8 +756,8 @@ pub enum Commands {
         command: DepCommands,
     },
 
-    /// Run read-only diagnostics
-    Doctor,
+    /// Run diagnostics and optionally repair issues
+    Doctor(DoctorArgs),
 
     /// Epic management commands
     Epic {
@@ -2250,6 +2250,14 @@ pub struct VersionArgs {
     /// Output only the version number (for scripts)
     #[arg(long, short = 's')]
     pub short: bool,
+}
+
+/// Arguments for the doctor command.
+#[derive(Args, Debug, Clone, Default)]
+pub struct DoctorArgs {
+    /// Attempt to repair detected issues (rebuilds DB from JSONL)
+    #[arg(long)]
+    pub repair: bool,
 }
 
 /// Arguments for the upgrade command.

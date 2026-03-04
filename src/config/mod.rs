@@ -600,12 +600,36 @@ pub struct ConfigLayer {
 
 impl ConfigLayer {
     /// Merge another layer on top of this one (higher precedence wins).
+    ///
+    /// Keys are normalized (hyphens replaced with underscores) before insertion
+    /// so that `issue-prefix` (from YAML) and `issue_prefix` (from defaults)
+    /// are treated as the same key and higher-precedence layers always win.
     pub fn merge_from(&mut self, other: &Self) {
         for (key, value) in &other.startup {
-            self.startup.insert(key.clone(), value.clone());
+            let canonical = key.replace('-', "_");
+            // Remove any variant of this key that already exists under a
+            // different spelling (e.g. hyphenated vs underscored).
+            if canonical != *key {
+                self.startup.remove(&canonical);
+            } else {
+                let hyphenated = key.replace('_', "-");
+                if hyphenated != *key {
+                    self.startup.remove(&hyphenated);
+                }
+            }
+            self.startup.insert(canonical, value.clone());
         }
         for (key, value) in &other.runtime {
-            self.runtime.insert(key.clone(), value.clone());
+            let canonical = key.replace('-', "_");
+            if canonical != *key {
+                self.runtime.remove(&canonical);
+            } else {
+                let hyphenated = key.replace('_', "-");
+                if hyphenated != *key {
+                    self.runtime.remove(&hyphenated);
+                }
+            }
+            self.runtime.insert(canonical, value.clone());
         }
     }
 
@@ -1065,10 +1089,13 @@ pub fn is_startup_key(key: &str) -> bool {
 }
 
 fn insert_key_value(layer: &mut ConfigLayer, key: &str, value: String) {
+    // Normalize hyphens to underscores so YAML keys like `issue-prefix`
+    // are stored under the same canonical key as `issue_prefix`.
+    let canonical = key.replace('-', "_");
     if is_startup_key(key) {
-        layer.startup.insert(key.to_string(), value);
+        layer.startup.insert(canonical, value);
     } else {
-        layer.runtime.insert(key.to_string(), value);
+        layer.runtime.insert(canonical, value);
     }
 }
 
@@ -1269,7 +1296,7 @@ issue_prefix: bd
 ";
         let value: serde_yml::Value = serde_yml::from_str(yaml).expect("parse yaml");
         let layer = layer_from_yaml_value(&value);
-        assert_eq!(layer.startup.get("no-db").unwrap(), "true");
+        assert_eq!(layer.startup.get("no_db").unwrap(), "true");
         assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "bd");
     }
 
@@ -1798,11 +1825,11 @@ labels:
         assert_eq!(layer.startup.get("db").unwrap(), "/cli/path.db");
         assert_eq!(layer.startup.get("actor").unwrap(), "cli_actor");
         assert_eq!(layer.startup.get("json").unwrap(), "true");
-        assert_eq!(layer.startup.get("no-db").unwrap(), "true");
-        assert_eq!(layer.startup.get("no-daemon").unwrap(), "true");
-        assert_eq!(layer.startup.get("no-auto-flush").unwrap(), "true");
-        assert_eq!(layer.startup.get("no-auto-import").unwrap(), "true");
-        assert_eq!(layer.startup.get("lock-timeout").unwrap(), "5000");
+        assert_eq!(layer.startup.get("no_db").unwrap(), "true");
+        assert_eq!(layer.startup.get("no_daemon").unwrap(), "true");
+        assert_eq!(layer.startup.get("no_auto_flush").unwrap(), "true");
+        assert_eq!(layer.startup.get("no_auto_import").unwrap(), "true");
+        assert_eq!(layer.startup.get("lock_timeout").unwrap(), "5000");
     }
 
     #[test]
@@ -1945,7 +1972,7 @@ routing:
 
         let layer = load_project_config(&beads_dir).expect("project config");
         assert_eq!(layer.runtime.get("issue_prefix").unwrap(), "proj");
-        assert_eq!(layer.startup.get("no-db").unwrap(), "false");
+        assert_eq!(layer.startup.get("no_db").unwrap(), "false");
     }
 
     #[test]

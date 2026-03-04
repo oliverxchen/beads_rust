@@ -140,6 +140,41 @@ impl SqliteStorage {
         })
     }
 
+    /// Execute a raw SQL statement (no parameters, no result).
+    ///
+    /// Useful for PRAGMAs and DDL that don't fit the normal mutation flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement fails.
+    pub fn execute_raw(&self, sql: &str) -> Result<()> {
+        self.conn.execute(sql)?;
+        Ok(())
+    }
+
+    /// Execute a raw SQL query and return all result rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub fn execute_raw_query(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let rows = self.conn.query(sql)?;
+        Ok(rows.iter().map(|r| r.values().to_vec()).collect())
+    }
+
+    /// Execute a raw SQL statement and return the number of affected rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement fails.
+    pub fn execute_raw_count(&self, sql: &str) -> Result<usize> {
+        let rows = self.conn.execute(sql)?;
+        Ok(rows)
+    }
+
     /// Attempt a WAL checkpoint (TRUNCATE mode) to flush WAL back to the main
     /// database file. Errors are logged but do not propagate — checkpoint
     /// failure is non-fatal and will be retried on the next interval.
@@ -436,45 +471,58 @@ impl SqliteStorage {
         })
     }
 
-    // Helper for cycle detection (refactored from would_create_cycle)
+    /// Iterative BFS cycle detection (replaces recursive CTE).
+    ///
+    /// Checks whether adding an edge `issue_id -> depends_on_id` would create
+    /// a cycle.  This works by starting from `depends_on_id` and walking its
+    /// transitive forward dependencies; if any reachable node equals `issue_id`,
+    /// a cycle would be formed.
+    ///
+    /// The previous implementation used a `WITH RECURSIVE` CTE, but
+    /// frankensqlite produces false positives for that query once the issue
+    /// count exceeds ~20 rows (see #131).  This Rust-side BFS is immune to
+    /// that bug and also avoids unbounded SQL recursion.
     fn check_cycle(
         conn: &Connection,
         issue_id: &str,
         depends_on_id: &str,
         blocking_only: bool,
     ) -> Result<bool> {
-        // Construct filter clause
         let type_filter = if blocking_only {
             "AND type IN ('blocks', 'parent-child', 'conditional-blocks', 'waits-for')"
         } else {
-            "" // No filter, follow all edges
+            ""
         };
 
         let query = format!(
-            r"
-            WITH RECURSIVE transitive_deps(id) AS (
-                -- Base case: direct dependencies of starting point
-                SELECT depends_on_id FROM dependencies 
-                WHERE issue_id = ?1 {type_filter}
-                UNION
-                -- Recursive step: follow dependencies forward
-                SELECT d.depends_on_id
-                FROM dependencies d
-                JOIN transitive_deps td ON d.issue_id = td.id
-                WHERE 1=1 {type_filter}
-            )
-            SELECT 1 FROM transitive_deps WHERE id = ?2 LIMIT 1;
-            "
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = ? {type_filter}"
         );
 
-        let rows = conn.query_with_params(
-            &query,
-            &[
-                SqliteValue::from(depends_on_id),
-                SqliteValue::from(issue_id),
-            ],
-        )?;
-        Ok(!rows.is_empty())
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut frontier: Vec<String> = vec![depends_on_id.to_string()];
+
+        while let Some(current) = frontier.pop() {
+            if current == issue_id {
+                return Ok(true);
+            }
+            if !visited.insert(current.clone()) {
+                continue; // already visited
+            }
+
+            let rows = conn.query_with_params(
+                &query,
+                &[SqliteValue::from(current.as_str())],
+            )?;
+            for row in &rows {
+                if let Some(next_id) = row.get(0).and_then(SqliteValue::as_text) {
+                    if !visited.contains(next_id) {
+                        frontier.push(next_id.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     /// Update an issue's fields.

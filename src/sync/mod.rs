@@ -305,6 +305,8 @@ pub struct ImportResult {
     pub conflict_markers: Vec<ConflictMarker>,
     /// Number of orphaned DB entries removed during --rebuild.
     pub orphans_removed: usize,
+    /// Number of orphaned FK rows cleaned after deferred-FK import.
+    pub orphan_cleaned_count: usize,
 }
 
 // ============================================================================
@@ -2386,6 +2388,12 @@ pub fn import_from_jsonl(
     }
 
     // Phase 3: Execute Actions
+    //
+    // Disable FK constraints during bulk import so that issues can reference
+    // other issues (in dependencies/comments) that haven't been inserted yet.
+    // FK integrity is validated after all data is loaded.
+    storage.execute_raw("PRAGMA foreign_keys = OFF")?;
+
     let progress = create_progress_bar(
         import_ops.len() as u64,
         "Importing issues",
@@ -2397,6 +2405,34 @@ pub fn import_from_jsonl(
         progress.inc(1);
     }
     progress.finish_with_message("Import complete");
+
+    // Re-enable FK constraints
+    storage.execute_raw("PRAGMA foreign_keys = ON")?;
+
+    // Clean up any orphaned rows left by FK-deferred import
+    // (e.g., dependencies referencing issues not in the JSONL)
+    let orphan_tables = &[
+        ("dependencies", "issue_id"),
+        ("labels", "issue_id"),
+        ("comments", "issue_id"),
+        ("events", "issue_id"),
+        ("dirty_issues", "issue_id"),
+        ("blocked_issues_cache", "issue_id"),
+        ("child_counters", "parent_id"),
+    ];
+    let mut orphans_cleaned = 0usize;
+    for (table, col) in orphan_tables {
+        let sql = format!(
+            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)"
+        );
+        if let Ok(n) = storage.execute_raw_count(&sql) {
+            orphans_cleaned += n;
+        }
+    }
+    if orphans_cleaned > 0 {
+        tracing::info!(count = orphans_cleaned, "Cleaned orphaned FK rows after import");
+        result.orphan_cleaned_count = orphans_cleaned;
+    }
 
     // Restore export hashes for imported issues
     if !new_export_hashes.is_empty() {

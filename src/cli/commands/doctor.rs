@@ -2,11 +2,14 @@
 
 #![allow(clippy::option_if_let_else)]
 
+use crate::cli::DoctorArgs;
 use crate::config;
-use crate::error::Result;
+use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::storage::SqliteStorage;
 use crate::sync::{
-    PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
+    ImportConfig, OrphanMode, PathValidation, import_from_jsonl, scan_conflict_markers,
+    validate_no_git_path, validate_sync_path,
 };
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -804,7 +807,7 @@ fn check_sync_metadata(
 ///
 /// Returns an error if report serialization fails or if IO operations fail.
 #[allow(clippy::too_many_lines)]
-pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
+pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     let mut checks = Vec::new();
     let Ok(beads_dir) = config::discover_beads_dir(None) else {
         push_check(
@@ -880,7 +883,7 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
         None
     };
 
-    let db_path = paths.db_path;
+    let db_path = paths.db_path.clone();
     if db_path.exists() {
         match Connection::open(db_path.to_string_lossy().into_owned()) {
             Ok(conn) => {
@@ -917,7 +920,126 @@ pub fn execute(cli: &config::CliOverrides, ctx: &OutputContext) -> Result<()> {
     };
     print_report(&report, ctx)?;
 
-    if !report.ok {
+    // --repair: rebuild DB from JSONL when errors are detected
+    if args.repair {
+        if report.ok {
+            if !ctx.is_json() {
+                ctx.info("No errors detected; nothing to repair.");
+            }
+            return Ok(());
+        }
+
+        let Some(jsonl_path) = jsonl_path.as_ref() else {
+            return Err(BeadsError::Config(
+                "Cannot repair: no JSONL file found to rebuild from".to_string(),
+            ));
+        };
+
+        if !ctx.is_json() {
+            ctx.info("Repairing: rebuilding DB from JSONL...");
+        }
+
+        // Remove the corrupt DB and its WAL/SHM files
+        for ext in &["", "-wal", "-shm"] {
+            let p = db_path.with_extension(
+                db_path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+                    + ext,
+            );
+            if p.exists() {
+                let _ = fs::remove_file(&p);
+            }
+        }
+        // Also remove exact WAL file pattern (e.g. storage.sqlite3-wal)
+        let db_str = db_path.to_string_lossy().to_string();
+        for suffix in &["-wal", "-shm"] {
+            let wal_path = PathBuf::from(format!("{db_str}{suffix}"));
+            if wal_path.exists() {
+                let _ = fs::remove_file(&wal_path);
+            }
+        }
+
+        // Open fresh storage (creates schema)
+        let mut storage = SqliteStorage::open(&db_path)?;
+
+        // Disable FK constraints during bulk import to avoid ordering issues
+        storage.execute_raw("PRAGMA foreign_keys = OFF")?;
+
+        // Import from JSONL
+        let import_config = ImportConfig {
+            force_upsert: true,
+            skip_prefix_validation: true,
+            clear_duplicate_external_refs: true,
+            orphan_mode: OrphanMode::Allow,
+            beads_dir: Some(beads_dir.clone()),
+            allow_external_jsonl: true,
+            show_progress: !ctx.is_json(),
+            rename_on_import: false,
+        };
+
+        match import_from_jsonl(&mut storage, jsonl_path, &import_config, None) {
+            Ok(result) => {
+                // Re-enable FK constraints
+                storage.execute_raw("PRAGMA foreign_keys = ON")?;
+
+                // Validate FK integrity after import
+                let fk_check = storage.execute_raw_query("PRAGMA foreign_key_check");
+                let fk_violations = fk_check.map_or(0, |rows| rows.len());
+
+                if fk_violations > 0 {
+                    tracing::warn!(
+                        violations = fk_violations,
+                        "FK violations found after repair import; cleaning orphans"
+                    );
+                    // Clean up orphaned rows in child tables
+                    for table in &[
+                        "dependencies",
+                        "labels",
+                        "comments",
+                        "events",
+                        "dirty_issues",
+                        "export_hashes",
+                        "blocked_issues_cache",
+                        "child_counters",
+                    ] {
+                        let col = if *table == "child_counters" {
+                            "parent_id"
+                        } else {
+                            "issue_id"
+                        };
+                        let cleanup = format!(
+                            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)"
+                        );
+                        let _ = storage.execute_raw(&cleanup);
+                    }
+                }
+
+                if !ctx.is_json() {
+                    ctx.info(&format!(
+                        "Repair complete: imported {}, skipped {}",
+                        result.imported_count, result.skipped_count
+                    ));
+                } else {
+                    ctx.json(&serde_json::json!({
+                        "repaired": true,
+                        "imported": result.imported_count,
+                        "skipped": result.skipped_count,
+                        "fk_violations_cleaned": fk_violations,
+                    }));
+                }
+            }
+            Err(err) => {
+                return Err(BeadsError::Config(format!(
+                    "Repair import failed: {err}. \
+                     The JSONL file may be corrupt. \
+                     Try manually editing the JSONL to fix invalid records."
+                )));
+            }
+        }
+    } else if !report.ok {
         std::process::exit(1);
     }
 

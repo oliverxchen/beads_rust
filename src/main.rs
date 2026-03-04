@@ -79,7 +79,7 @@ fn main() {
             commands::blocked::execute(&args, cli.json || args.robot, &overrides, &output_ctx)
         }
         Commands::Sync(args) => commands::sync::execute(&args, cli.json, &overrides, &output_ctx),
-        Commands::Doctor => commands::doctor::execute(&overrides, &output_ctx),
+        Commands::Doctor(args) => commands::doctor::execute(&args, &overrides, &output_ctx),
         Commands::Info(args) => commands::info::execute(&args, &overrides, &output_ctx),
         Commands::Schema(args) => commands::schema::execute(&args, &overrides, &output_ctx),
         Commands::Where => commands::r#where::execute(&overrides, &output_ctx),
@@ -194,7 +194,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         // Explicitly excluded: init, sync, diagnostic, and config commands
         Commands::Init { .. }
         | Commands::Sync(_)
-        | Commands::Doctor
+        | Commands::Doctor(_)
         | Commands::Info(_)
         | Commands::Schema(_)
         | Commands::Where
