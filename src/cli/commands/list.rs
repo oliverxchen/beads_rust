@@ -47,10 +47,19 @@ pub fn execute(
     // Build filter from args
     let mut filters = build_filters(args)?;
     let client_filters = needs_client_filters(args);
-    let limit = if client_filters {
+
+    // Extract user limit for both paths so we can detect truncation.
+    let user_limit = if client_filters {
         filters.limit.take()
     } else {
-        None
+        // Bump SQL limit by 1 to detect whether results were truncated.
+        let ul = filters.limit;
+        if let Some(lim) = filters.limit
+            && lim > 0
+        {
+            filters.limit = Some(lim + 1);
+        }
+        ul
     };
 
     // Validate sort key before query
@@ -64,15 +73,40 @@ pub fn execute(
         issues
     };
 
-    if let Some(limit) = limit
+    // Detect and apply truncation.
+    // For client-filter path we know the exact pre-truncation count.
+    // For SQL path we only know "more than limit" (we fetched limit+1).
+    let total_before = issues.len();
+    let truncated = if let Some(limit) = user_limit
         && limit > 0
         && issues.len() > limit
     {
         issues.truncate(limit);
-    }
+        true
+    } else {
+        false
+    };
 
     // Determine output format: --json flag overrides --format
     let output_format = resolve_output_format(args.format, outer_ctx.is_json(), false);
+
+    // Warn on stderr when results were truncated (skip for structured output)
+    if truncated && !matches!(output_format, OutputFormat::Json | OutputFormat::Toon) {
+        if client_filters {
+            // Exact total known from client-side filtering
+            eprintln!(
+                "[note] Showing {} of {} issues. Use --limit 0 for all results.",
+                issues.len(),
+                total_before,
+            );
+        } else {
+            // SQL-side truncation: we only know there are more
+            eprintln!(
+                "[note] Output truncated to {} issues. Use --limit 0 for all results.",
+                issues.len(),
+            );
+        }
+    }
     let quiet = cli.quiet.unwrap_or(false);
     let ctx = OutputContext::from_output_format(output_format, quiet, !use_color);
     if matches!(ctx.mode(), OutputMode::Quiet) {

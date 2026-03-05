@@ -1016,6 +1016,18 @@ pub struct QuickArgs {
     /// Labels to apply (repeatable, comma-separated allowed)
     #[arg(long, short = 'l', add = ArgValueCompleter::new(label_completer))]
     pub labels: Vec<String>,
+
+    /// Description
+    #[arg(long, short = 'd', visible_alias = "body")]
+    pub description: Option<String>,
+
+    /// Parent issue ID (creates parent-child dep)
+    #[arg(long, add = ArgValueCompleter::new(issue_id_completer))]
+    pub parent: Option<String>,
+
+    /// Time estimate in minutes
+    #[arg(long, short = 'e')]
+    pub estimate: Option<i32>,
 }
 
 #[derive(Args, Debug, Default)]

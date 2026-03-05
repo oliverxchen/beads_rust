@@ -1,9 +1,9 @@
 use crate::cli::QuickArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
-use crate::model::{Issue, IssueType, Priority, Status};
+use crate::model::{Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use crate::output::{OutputContext, OutputMode};
-use crate::util::id::IdGenerator;
+use crate::util::id::{IdGenerator, child_id};
 use crate::validation::LabelValidator;
 use chrono::Utc;
 use rich_rust::prelude::*;
@@ -53,13 +53,42 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         default_issue_type
     };
 
-    let id_gen = IdGenerator::new(id_config);
     let now = Utc::now();
-    let count = storage.count_issues()?;
 
-    let id = id_gen.generate(&title, None, None, now, count, |candidate| {
-        storage.id_exists(candidate).unwrap_or(false)
-    });
+    // When a parent is specified, generate a child ID (parent.1, parent.2, etc.)
+    let id = if let Some(ref parent_id) = args.parent {
+        if !storage.id_exists(parent_id).unwrap_or(false) {
+            return Err(BeadsError::IssueNotFound {
+                id: parent_id.clone(),
+            });
+        }
+        let next_num = storage.next_child_number(parent_id)?;
+        let candidate = child_id(parent_id, next_num);
+        if storage.id_exists(&candidate).unwrap_or(false) {
+            let mut num = next_num + 1;
+            loop {
+                let alt = child_id(parent_id, num);
+                if !storage.id_exists(&alt).unwrap_or(false) {
+                    break alt;
+                }
+                num += 1;
+                if num > next_num + 100 {
+                    return Err(BeadsError::validation(
+                        "parent",
+                        "could not find available child ID",
+                    ));
+                }
+            }
+        } else {
+            candidate
+        }
+    } else {
+        let id_gen = IdGenerator::new(id_config);
+        let count = storage.count_issues()?;
+        id_gen.generate(&title, None, None, now, count, |candidate| {
+            storage.id_exists(candidate).unwrap_or(false)
+        })
+    };
 
     let mut valid_labels = Vec::new();
     let labels = split_labels(&args.labels);
@@ -74,7 +103,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let mut issue = Issue {
         id,
         title,
-        description: None,
+        description: args.description,
         status: Status::Open,
         priority,
         issue_type,
@@ -86,7 +115,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         notes: None,
         assignee: None,
         owner: None,
-        estimated_minutes: None,
+        estimated_minutes: args.estimate,
         created_by: None,
         closed_at: None,
         close_reason: None,
@@ -116,6 +145,19 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     // Resolve actor and set created_by
     let actor = config::resolve_actor(&layer);
     issue.created_by = Some(actor.clone());
+
+    // Parent dependency
+    if let Some(ref parent_id) = args.parent {
+        issue.dependencies.push(Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: parent_id.clone(),
+            dep_type: DependencyType::ParentChild,
+            created_at: now,
+            created_by: Some(actor.clone()),
+            metadata: None,
+            thread_id: None,
+        });
+    }
 
     // Compute content hash
     issue.content_hash = Some(issue.compute_content_hash());
