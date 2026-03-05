@@ -950,7 +950,9 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                     + ext,
             );
             if p.exists() {
-                let _ = fs::remove_file(&p);
+                if let Err(e) = fs::remove_file(&p) {
+                    tracing::warn!(path = %p.display(), error = %e, "Failed to remove corrupt DB file");
+                }
             }
         }
         // Also remove exact WAL file pattern (e.g. storage.sqlite3-wal)
@@ -958,15 +960,17 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         for suffix in &["-wal", "-shm"] {
             let wal_path = PathBuf::from(format!("{db_str}{suffix}"));
             if wal_path.exists() {
-                let _ = fs::remove_file(&wal_path);
+                if let Err(e) = fs::remove_file(&wal_path) {
+                    tracing::warn!(path = %wal_path.display(), error = %e, "Failed to remove WAL/SHM file");
+                }
             }
         }
 
         // Open fresh storage (creates schema)
         let mut storage = SqliteStorage::open(&db_path)?;
 
-        // Disable FK constraints during bulk import to avoid ordering issues
-        storage.execute_raw("PRAGMA foreign_keys = OFF")?;
+        // Note: import_from_jsonl manages its own FK deferral internally
+        // (disables FKs before bulk insert, re-enables after, then cleans orphans)
 
         // Import from JSONL
         let import_config = ImportConfig {
@@ -982,9 +986,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 
         match import_from_jsonl(&mut storage, jsonl_path, &import_config, None) {
             Ok(result) => {
-                // Re-enable FK constraints
-                storage.execute_raw("PRAGMA foreign_keys = ON")?;
-
                 // Validate FK integrity after import
                 let fk_check = storage.execute_raw_query("PRAGMA foreign_key_check");
                 let fk_violations = fk_check.map_or(0, |rows| rows.len());

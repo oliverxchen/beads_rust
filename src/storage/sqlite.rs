@@ -147,7 +147,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the statement fails.
-    pub fn execute_raw(&self, sql: &str) -> Result<()> {
+    pub(crate) fn execute_raw(&self, sql: &str) -> Result<()> {
         self.conn.execute(sql)?;
         Ok(())
     }
@@ -157,7 +157,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the query fails.
-    pub fn execute_raw_query(
+    pub(crate) fn execute_raw_query(
         &self,
         sql: &str,
     ) -> Result<Vec<Vec<SqliteValue>>> {
@@ -170,7 +170,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the statement fails.
-    pub fn execute_raw_count(&self, sql: &str) -> Result<usize> {
+    pub(crate) fn execute_raw_count(&self, sql: &str) -> Result<usize> {
         let rows = self.conn.execute(sql)?;
         Ok(rows)
     }
