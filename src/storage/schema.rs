@@ -13,6 +13,7 @@ pub const SCHEMA_SQL: &str = r"
     -- Issues table
     -- Note: TEXT fields use DEFAULT '' for bd (Go) compatibility.
     -- bd's sql.Scan doesn't handle NULL well when scanning into string fields.
+    -- Closed-at invariant is enforced by the CHECK clause below.
     CREATE TABLE IF NOT EXISTS issues (
         id TEXT PRIMARY KEY,
         content_hash TEXT,
@@ -50,7 +51,6 @@ pub const SCHEMA_SQL: &str = r"
         ephemeral INTEGER DEFAULT 0,
         pinned INTEGER DEFAULT 0,
         is_template INTEGER DEFAULT 0,
-        -- Closed-at invariant: closed issues MUST have closed_at timestamp
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -185,10 +185,11 @@ pub const SCHEMA_SQL: &str = r"
     );
 
     -- Blocked Issues Cache (Materialized view)
-    -- Rebuilt on dependency or status changes
+    -- Rebuilt on dependency or status changes.
+    -- `blocked_by` stores a JSON array of blocking issue IDs.
     CREATE TABLE IF NOT EXISTS blocked_issues_cache (
         issue_id TEXT PRIMARY KEY,
-        blocked_by TEXT NOT NULL,  -- JSON array of blocking issue IDs
+        blocked_by TEXT NOT NULL,
         blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
@@ -235,6 +236,15 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // Run migrations for existing databases
     run_migrations(conn)?;
 
+    apply_runtime_pragmas(conn)?;
+
+    // Mark schema as applied so future opens can skip DDL/migration work.
+    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))?;
+
+    Ok(())
+}
+
+pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     // Set journal mode to WAL for concurrency
     conn.execute("PRAGMA journal_mode = WAL")?;
 
@@ -248,27 +258,22 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     conn.execute("PRAGMA temp_store = MEMORY")?;
     // 8MB page cache (default is ~2MB), improves read-heavy workloads
     conn.execute("PRAGMA cache_size = -8000")?;
-    // Mark schema as applied so future opens can skip DDL/migration work.
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))?;
 
     Ok(())
 }
 
 fn table_exists(conn: &Connection, table: &str) -> bool {
-    conn.query_with_params(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-        &[SqliteValue::from(table)],
-    )
-    .is_ok_and(|rows| !rows.is_empty())
+    let escaped_table = table.replace('\'', "''");
+    let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
+    conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-    // Use parameterized query for the column name to prevent SQL injection.
-    // Note: pragma_table_info() requires the table name directly (can't be parameterized),
-    // but we validate it's a known table name before calling this function.
-    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?");
-    conn.query_with_params(&sql, &[SqliteValue::from(column)])
-        .is_ok_and(|rows| !rows.is_empty())
+    let sql = format!("PRAGMA table_info('{table}')");
+    conn.query(&sql).is_ok_and(|rows| {
+        rows.iter()
+            .any(|row| row.get(1).and_then(SqliteValue::as_text) == Some(column))
+    })
 }
 
 const ISSUE_COLUMNS: &[(&str, &str)] = &[
@@ -347,6 +352,13 @@ fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> R
     }
 
     Ok(())
+}
+
+fn table_has_columns(conn: &Connection, table: &str, required_columns: &[&str]) -> bool {
+    table_exists(conn, table)
+        && required_columns
+            .iter()
+            .all(|column| column_exists(conn, table, column))
 }
 
 /// Expected column order for the issues table (id + ISSUE_COLUMNS names).
@@ -538,8 +550,13 @@ fn kv_table_uses_primary_key(conn: &Connection, table: &str) -> bool {
         return false;
     }
 
-    let sql = format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name='key' AND pk=1");
-    conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+    let sql = format!("PRAGMA table_info('{table}')");
+    conn.query(&sql).is_ok_and(|rows| {
+        rows.iter().any(|row| {
+            row.get(1).and_then(SqliteValue::as_text) == Some("key")
+                && row.get(5).and_then(SqliteValue::as_integer) == Some(1)
+        })
+    })
 }
 
 fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()> {
@@ -617,12 +634,78 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
     ensure_columns(conn, "comments", COMMENT_COLUMNS)?;
     ensure_columns(conn, "events", EVENT_COLUMNS)?;
 
-    // Always drop idx_issues_ready so SCHEMA_SQL recreates it with the
-    // current definition (including is_template filter). DROP INDEX is O(1)
-    // and SCHEMA_SQL's CREATE INDEX is fast for typical issue counts.
-    conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
+    // Intentionally do not rebuild idx_issues_ready here.
+    //
+    // Older databases may have a stale partial-index predicate, but that is a
+    // performance issue rather than a correctness issue. On large file-backed
+    // databases, exercising DROP INDEX through frankensqlite currently trips an
+    // out-of-memory failure. Additionally, frankensqlite's in-memory schema
+    // representation does not reliably preserve partial-index predicates, so br
+    // cannot distinguish a stale ready index from a current one at open time.
 
     Ok(())
+}
+
+pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
+    let issues_ok = issues_column_order_matches(conn);
+    let dependencies_ok = table_has_columns(conn, "dependencies", &["issue_id", "depends_on_id"])
+        && DEPENDENCY_COLUMNS
+            .iter()
+            .all(|(name, _)| column_exists(conn, "dependencies", name));
+    let labels_ok = table_has_columns(conn, "labels", &["issue_id", "label"]);
+    let comments_ok = table_has_columns(conn, "comments", &["id", "issue_id"])
+        && COMMENT_COLUMNS
+            .iter()
+            .all(|(name, _)| column_exists(conn, "comments", name));
+    let events_ok = table_has_columns(conn, "events", &["id", "issue_id"])
+        && EVENT_COLUMNS
+            .iter()
+            .all(|(name, _)| column_exists(conn, "events", name));
+    let config_ok = table_has_columns(conn, "config", &["key", "value"]);
+    let metadata_ok = table_has_columns(conn, "metadata", &["key", "value"]);
+    let dirty_issues_ok = table_has_columns(conn, "dirty_issues", &["issue_id", "marked_at"]);
+    let export_hashes_ok = table_has_columns(
+        conn,
+        "export_hashes",
+        &["issue_id", "content_hash", "exported_at"],
+    );
+    let blocked_cache_ok = table_has_columns(
+        conn,
+        "blocked_issues_cache",
+        &["issue_id", "blocked_by", "blocked_at"],
+    );
+    let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
+
+    let compatible = issues_ok
+        && dependencies_ok
+        && labels_ok
+        && comments_ok
+        && events_ok
+        && config_ok
+        && metadata_ok
+        && dirty_issues_ok
+        && export_hashes_ok
+        && blocked_cache_ok
+        && child_counters_ok;
+
+    if !compatible {
+        tracing::debug!(
+            issues_ok,
+            dependencies_ok,
+            labels_ok,
+            comments_ok,
+            events_ok,
+            config_ok,
+            metadata_ok,
+            dirty_issues_ok,
+            export_hashes_ok,
+            blocked_cache_ok,
+            child_counters_ok,
+            "runtime schema compatibility check failed"
+        );
+    }
+
+    compatible
 }
 
 /// Run schema migrations for existing databases.
@@ -632,17 +715,9 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<()> {
 fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration: Ensure blocked_issues_cache has correct schema (blocked_by, blocked_at)
     // Check for old column name (blocked_by_json) or missing columns
-    let has_blocked_by: bool = conn
-        .query("SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='blocked_by'")
-        .is_ok_and(|rows| !rows.is_empty());
-
-    let has_blocked_at: bool = conn
-        .query("SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='blocked_at'")
-        .is_ok_and(|rows| !rows.is_empty());
-
-    let has_issue_id: bool = conn
-        .query("SELECT 1 FROM pragma_table_info('blocked_issues_cache') WHERE name='issue_id'")
-        .is_ok_and(|rows| !rows.is_empty());
+    let has_blocked_by = column_exists(conn, "blocked_issues_cache", "blocked_by");
+    let has_blocked_at = column_exists(conn, "blocked_issues_cache", "blocked_at");
+    let has_issue_id = column_exists(conn, "blocked_issues_cache", "issue_id");
 
     if !has_blocked_by || !has_blocked_at || !has_issue_id {
         // Table needs update - drop and recreate (it's a cache, data is regenerated)
@@ -661,9 +736,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     }
 
     // Migration: ensure compaction_level is never NULL (bd compatibility)
-    let has_compaction_level: bool = conn
-        .query("SELECT 1 FROM pragma_table_info('issues') WHERE name='compaction_level'")
-        .is_ok_and(|rows| !rows.is_empty());
+    let has_compaction_level = column_exists(conn, "issues", "compaction_level");
 
     if has_compaction_level {
         conn.execute("UPDATE issues SET compaction_level = 0 WHERE compaction_level IS NULL")?;
@@ -1413,6 +1486,29 @@ mod tests {
         assert_eq!(
             metadata_latest.get(0).and_then(SqliteValue::as_text),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn test_runtime_schema_compatible_accepts_legacy_kv_primary_keys() {
+        let conn = Connection::open(":memory:").unwrap();
+        apply_schema(&conn).expect("schema");
+
+        conn.execute("DROP INDEX IF EXISTS idx_config_key")
+            .expect("drop config index");
+        conn.execute("DROP TABLE config").expect("drop config");
+        conn.execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .expect("recreate legacy config");
+
+        conn.execute("DROP INDEX IF EXISTS idx_metadata_key")
+            .expect("drop metadata index");
+        conn.execute("DROP TABLE metadata").expect("drop metadata");
+        conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            .expect("recreate legacy metadata");
+
+        assert!(
+            runtime_schema_compatible(&conn),
+            "legacy config/metadata primary keys should still be treated as runtime-compatible"
         );
     }
 }

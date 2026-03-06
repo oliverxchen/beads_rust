@@ -4,7 +4,9 @@ use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
 use crate::storage::events::get_events;
-use crate::storage::schema::{CURRENT_SCHEMA_VERSION, apply_schema};
+use crate::storage::schema::{
+    CURRENT_SCHEMA_VERSION, apply_runtime_pragmas, apply_schema, runtime_schema_compatible,
+};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -119,7 +121,13 @@ impl SqliteStorage {
             .and_then(|r| r.get(0).and_then(SqliteValue::as_integer))
             .unwrap_or(0) as i32;
         if user_version < CURRENT_SCHEMA_VERSION {
-            apply_schema(&conn)?;
+            if runtime_schema_compatible(&conn) {
+                apply_runtime_pragmas(&conn)?;
+            } else {
+                apply_schema(&conn)?;
+            }
+        } else {
+            apply_runtime_pragmas(&conn)?;
         }
         Ok(Self {
             conn,
@@ -5229,6 +5237,63 @@ mod tests {
         );
 
         lock_conn.execute("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn test_open_skips_full_schema_for_runtime_compatible_legacy_db() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("legacy_runtime_compatible.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("DROP INDEX IF EXISTS idx_config_key")
+                .unwrap();
+            storage.conn.execute("DROP TABLE config").unwrap();
+            storage
+                .conn
+                .execute("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
+
+            storage
+                .conn
+                .execute("DROP INDEX IF EXISTS idx_metadata_key")
+                .unwrap();
+            storage.conn.execute("DROP TABLE metadata").unwrap();
+            storage
+                .conn
+                .execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
+
+            storage.conn.execute("PRAGMA user_version = 0").unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let user_version = reopened
+            .conn
+            .query_row("PRAGMA user_version")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert_eq!(
+            user_version, 0,
+            "runtime-compatible legacy DBs should skip full schema application on open"
+        );
+
+        let config_columns: Vec<String> = reopened
+            .conn
+            .query("PRAGMA table_info(config)")
+            .unwrap()
+            .iter()
+            .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(str::to_owned))
+            .collect();
+        assert_eq!(
+            config_columns,
+            vec!["key".to_string(), "value".to_string()],
+            "open should preserve the legacy config table shape when schema application is skipped"
+        );
     }
 
     #[test]
