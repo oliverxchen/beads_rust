@@ -31,7 +31,10 @@ shopt -s lastpipe 2>/dev/null || true
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-beads_rust}"
-BINARY_NAME="br"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) BINARY_NAME="br.exe" ;;
+    *) BINARY_NAME="br" ;;
+esac
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 EASY=0
@@ -1032,7 +1035,11 @@ download_release() {
         url="$ARTIFACT_URL"
         archive_name="$(basename "$ARTIFACT_URL")"
     else
-        archive_name="br-${VERSION}-${platform}.tar.gz"
+        local archive_ext="tar.gz"
+        case "$platform" in
+            windows_*) archive_ext="zip" ;;
+        esac
+        archive_name="br-${VERSION}-${platform}.${archive_ext}"
         url="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${archive_name}"
     fi
 
@@ -1085,9 +1092,43 @@ download_release() {
 
     # Extract
     log_step "Extracting..."
-    if ! tar -xzf "$TMP/$archive_name" -C "$TMP" 2>/dev/null; then
-        return 1
-    fi
+    case "$archive_name" in
+        *.tar.gz)
+            if ! tar -xzf "$TMP/$archive_name" -C "$TMP" 2>/dev/null; then
+                return 1
+            fi
+            ;;
+        *.zip)
+            if command -v unzip &>/dev/null; then
+                if ! unzip -q "$TMP/$archive_name" -d "$TMP" 2>/dev/null; then
+                    return 1
+                fi
+            elif command -v bsdtar &>/dev/null; then
+                if ! bsdtar -xf "$TMP/$archive_name" -C "$TMP" 2>/dev/null; then
+                    return 1
+                fi
+            elif command -v python3 &>/dev/null; then
+                if ! python3 - "$TMP/$archive_name" "$TMP" <<'PY'
+import sys
+import zipfile
+
+archive_path, extract_dir = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive_path) as archive:
+    archive.extractall(extract_dir)
+PY
+                then
+                    return 1
+                fi
+            else
+                log_error "No zip extractor available (need unzip, bsdtar, or python3)"
+                return 1
+            fi
+            ;;
+        *)
+            log_error "Unsupported archive format: $archive_name"
+            return 1
+            ;;
+    esac
 
     # Find binary
     local bin="$TMP/$BINARY_NAME"
