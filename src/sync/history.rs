@@ -37,6 +37,55 @@ pub struct BackupEntry {
     pub size: u64,
 }
 
+fn parse_backup_timestamp(ts_str: &str) -> Option<DateTime<Utc>> {
+    for fmt in ["%Y%m%d_%H%M%S_%f", "%Y%m%d_%H%M%S"] {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(ts_str, fmt) {
+            return Some(Utc.from_utc_datetime(&dt));
+        }
+    }
+
+    None
+}
+
+pub(crate) fn parse_backup_filename(filename: &str) -> Option<(String, DateTime<Utc>)> {
+    let without_ext = filename.strip_suffix(".jsonl")?;
+    let (prefix, last_component) = without_ext.rsplit_once('.')?;
+
+    let (stem, timestamp_str) = if last_component.chars().all(|ch| ch.is_ascii_digit()) {
+        let (stem, timestamp_str) = prefix.rsplit_once('.')?;
+        (stem, timestamp_str)
+    } else {
+        (prefix, last_component)
+    };
+
+    if stem.is_empty() {
+        return None;
+    }
+
+    let timestamp = parse_backup_timestamp(timestamp_str)?;
+    Some((stem.to_string(), timestamp))
+}
+
+fn next_backup_path(history_dir: &Path, file_stem: &str) -> Result<PathBuf> {
+    let timestamp = Utc::now().format("%Y%m%d_%H%M%S_%f").to_string();
+
+    for collision_idx in 0..1024_u32 {
+        let backup_name = if collision_idx == 0 {
+            format!("{file_stem}.{timestamp}.jsonl")
+        } else {
+            format!("{file_stem}.{timestamp}.{collision_idx}.jsonl")
+        };
+        let backup_path = history_dir.join(backup_name);
+        if !backup_path.exists() {
+            return Ok(backup_path);
+        }
+    }
+
+    Err(BeadsError::Config(format!(
+        "Failed to allocate unique backup path for {file_stem}"
+    )))
+}
+
 /// Backup the JSONL file before export.
 ///
 /// # Errors
@@ -68,10 +117,9 @@ pub fn backup_before_export(
         .and_then(|s| s.to_str())
         .unwrap_or("issues");
 
-    // Create timestamped backup
-    let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-    let backup_name = format!("{file_stem}.{timestamp}.jsonl");
-    let backup_path = history_dir.join(backup_name);
+    // Create a timestamped backup name with collision resistance so rapid
+    // exports do not overwrite each other's history entries.
+    let backup_path = next_backup_path(&history_dir, file_stem)?;
 
     // Check if the content is identical to the most recent backup (deduplication)
     // We only check against backups that match the target's stem to avoid false positives
@@ -175,19 +223,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
             continue;
         }
 
-        // Parse timestamp from filename: <stem>.YYYYMMDD_HHMMSS.jsonl
-        // We split by dot and treat the second-to-last component as the timestamp.
-        let parts: Vec<&str> = name.split('.').collect();
-        if parts.len() < 3 {
-            continue;
-        }
-
-        let ts_str = parts[parts.len() - 2];
-        if ts_str.len() != 15 {
-            continue;
-        }
-
-        let Ok(dt) = NaiveDateTime::parse_from_str(ts_str, "%Y%m%d_%H%M%S") else {
+        let Some((_, timestamp)) = parse_backup_filename(name) else {
             continue;
         };
 
@@ -195,7 +231,6 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
             continue;
         };
 
-        let timestamp = Utc.from_utc_datetime(&dt);
         backups.push(BackupEntry {
             path,
             timestamp,
@@ -407,6 +442,55 @@ mod tests {
         // Newest first
         assert!(backups[0].path.to_string_lossy().contains("20230102"));
         assert!(backups[1].path.to_string_lossy().contains("20230101"));
+    }
+
+    #[test]
+    fn test_list_backups_parses_high_precision_timestamps_and_collision_suffix() {
+        let temp = TempDir::new().unwrap();
+        let history_dir = temp.path();
+
+        File::create(history_dir.join("issues.20230101_100000_123456.1.jsonl")).unwrap();
+        File::create(history_dir.join("issues.20230101_100001_654321.jsonl")).unwrap();
+
+        let backups = list_backups(history_dir, None).unwrap();
+        assert_eq!(backups.len(), 2);
+        assert!(
+            backups[0]
+                .path
+                .to_string_lossy()
+                .contains("20230101_100001_654321")
+        );
+        assert!(
+            backups[1]
+                .path
+                .to_string_lossy()
+                .contains("20230101_100000_123456.1")
+        );
+    }
+
+    #[test]
+    fn test_rapid_distinct_backups_do_not_collide() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let target = beads_dir.join("issues.jsonl");
+        let config = HistoryConfig::default();
+
+        File::create(&target)
+            .unwrap()
+            .write_all(b"version-1")
+            .unwrap();
+        backup_before_export(&beads_dir, &config, &target).unwrap();
+
+        File::create(&target)
+            .unwrap()
+            .write_all(b"version-2")
+            .unwrap();
+        backup_before_export(&beads_dir, &config, &target).unwrap();
+
+        let backups = list_backups(&beads_dir.join(".br_history"), Some("issues.")).unwrap();
+        assert_eq!(backups.len(), 2);
     }
 
     #[test]

@@ -1864,7 +1864,7 @@ pub struct AutoFlushResult {
 /// This is the auto-flush operation that runs at the end of mutating commands
 /// (unless `--no-auto-flush` is set). It:
 /// 1. Checks for dirty issues
-/// 2. If any exist, exports them to the default JSONL path
+/// 2. If any exist, exports them to the resolved JSONL path
 /// 3. Clears dirty flags and updates metadata
 ///
 /// Returns early (no-op) if there are no dirty issues.
@@ -1873,11 +1873,16 @@ pub struct AutoFlushResult {
 ///
 /// * `storage` - Mutable reference to the `SQLite` storage
 /// * `beads_dir` - Path to the .beads directory
+/// * `jsonl_path` - Resolved JSONL export target for this workspace
 ///
 /// # Errors
 ///
 /// Returns an error if the export fails.
-pub fn auto_flush(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<AutoFlushResult> {
+pub fn auto_flush(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+) -> Result<AutoFlushResult> {
     // Check for dirty issues first
     let dirty_count = storage.get_dirty_issue_count()?;
     if dirty_count == 0 {
@@ -1886,9 +1891,6 @@ pub fn auto_flush(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<AutoF
     }
 
     tracing::debug!(dirty_count, "Auto-flush: exporting dirty issues");
-
-    // Default JSONL path
-    let jsonl_path = beads_dir.join("issues.jsonl");
 
     // Configure export with defaults, including beads_dir for path validation
     let export_config = ExportConfig {
@@ -1899,7 +1901,7 @@ pub fn auto_flush(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<AutoF
 
     // Perform export
     let (export_result, _report) =
-        export_to_jsonl_with_policy(storage, &jsonl_path, &export_config)?;
+        export_to_jsonl_with_policy(storage, jsonl_path, &export_config)?;
 
     // Finalize export (clear dirty flags, update metadata)
     finalize_export(storage, &export_result, Some(&export_result.issue_hashes))?;
@@ -2316,9 +2318,6 @@ pub fn import_from_jsonl(
         }
     }
 
-    // Clear export hashes before importing new data.
-    storage.clear_all_export_hashes()?;
-
     // Phase 1: Scan and Resolve IDs
     let mut seen_external_refs: HashSet<String> = HashSet::new();
     let mut renames: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -2382,6 +2381,8 @@ pub fn import_from_jsonl(
     }
     progress.finish_with_message("Scan complete");
 
+    let jsonl_hash = compute_jsonl_hash(input_path)?;
+
     // Phase 2: Remap Dependencies
     if !renames.is_empty() {
         for (issue, _) in &mut import_ops {
@@ -2415,61 +2416,104 @@ pub fn import_from_jsonl(
     // other issues (in dependencies/comments) that haven't been inserted yet.
     // FK integrity is validated after all data is loaded.
     storage.execute_raw("PRAGMA foreign_keys = OFF")?;
-
     let progress = create_progress_bar(
         import_ops.len() as u64,
         "Importing issues",
         config.show_progress,
     );
+    let apply_result = (|| -> Result<ImportResult> {
+        storage.execute_raw("BEGIN IMMEDIATE")?;
 
-    for (issue, action) in import_ops {
-        process_import_action(storage, &action, &issue, &mut result)?;
-        progress.inc(1);
-    }
-    progress.finish_with_message("Import complete");
+        let tx_result = (|| -> Result<ImportResult> {
+            // Keep export-hash state transactional so failed imports do not
+            // erase incremental export bookkeeping.
+            storage.clear_all_export_hashes_in_tx()?;
 
-    // Re-enable FK constraints
-    storage.execute_raw("PRAGMA foreign_keys = ON")?;
+            for (issue, action) in import_ops {
+                process_import_action(storage, &action, &issue, &mut result)?;
+                progress.inc(1);
+            }
 
-    // Clean up any orphaned rows left by FK-deferred import
-    // (e.g., dependencies referencing issues not in the JSONL)
-    let orphan_tables = &[
-        ("dependencies", "issue_id"),
-        ("labels", "issue_id"),
-        ("comments", "issue_id"),
-        ("events", "issue_id"),
-        ("dirty_issues", "issue_id"),
-        ("blocked_issues_cache", "issue_id"),
-        ("child_counters", "parent_id"),
-    ];
-    let mut orphans_cleaned = 0usize;
-    for (table, col) in orphan_tables {
-        let sql = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
-        if let Ok(n) = storage.execute_raw_count(&sql) {
-            orphans_cleaned += n;
+            // Clean up any orphaned rows left by FK-deferred import
+            // (e.g., dependencies referencing issues not in the JSONL)
+            let orphan_tables = &[
+                ("dependencies", "issue_id"),
+                ("labels", "issue_id"),
+                ("comments", "issue_id"),
+                ("events", "issue_id"),
+                ("dirty_issues", "issue_id"),
+                ("blocked_issues_cache", "issue_id"),
+                ("child_counters", "parent_id"),
+            ];
+            let mut orphans_cleaned = 0usize;
+            for (table, col) in orphan_tables {
+                let sql = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
+                orphans_cleaned += storage.execute_raw_count(&sql)?;
+            }
+            if orphans_cleaned > 0 {
+                tracing::info!(
+                    count = orphans_cleaned,
+                    "Cleaned orphaned FK rows after import"
+                );
+                result.orphan_cleaned_count = orphans_cleaned;
+            }
+
+            if !new_export_hashes.is_empty() {
+                storage.set_export_hashes_in_tx(&new_export_hashes)?;
+            }
+
+            storage.rebuild_blocked_cache_in_tx()?;
+            storage
+                .set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
+            storage.set_metadata_in_tx(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
+
+            Ok(result)
+        })();
+
+        match tx_result {
+            Ok(import_result) => {
+                if let Err(err) = storage.execute_raw("COMMIT") {
+                    let _ = storage.execute_raw("ROLLBACK");
+                    Err(err)
+                } else {
+                    Ok(import_result)
+                }
+            }
+            Err(err) => {
+                let _ = storage.execute_raw("ROLLBACK");
+                Err(err)
+            }
+        }
+    })();
+
+    let fk_restore_result = storage.execute_raw("PRAGMA foreign_keys = ON");
+    match (apply_result, fk_restore_result) {
+        (Ok(import_result), Ok(())) => {
+            progress.finish_with_message("Import complete");
+            Ok(import_result)
+        }
+        (Err(import_err), Ok(())) => {
+            progress.finish_and_clear();
+            Err(import_err)
+        }
+        (Ok(_), Err(fk_err)) => {
+            progress.finish_and_clear();
+            Err(BeadsError::WithContext {
+                context: "Import committed but failed to re-enable foreign key enforcement"
+                    .to_string(),
+                source: Box::new(fk_err),
+            })
+        }
+        (Err(import_err), Err(fk_err)) => {
+            progress.finish_and_clear();
+            Err(BeadsError::WithContext {
+                context: format!(
+                    "Import failed ({import_err}) and foreign key enforcement could not be restored"
+                ),
+                source: Box::new(fk_err),
+            })
         }
     }
-    if orphans_cleaned > 0 {
-        tracing::info!(
-            count = orphans_cleaned,
-            "Cleaned orphaned FK rows after import"
-        );
-        result.orphan_cleaned_count = orphans_cleaned;
-    }
-
-    // Restore export hashes for imported issues
-    if !new_export_hashes.is_empty() {
-        storage.set_export_hashes(&new_export_hashes)?;
-    }
-
-    // Step 10: Refresh blocked cache
-    storage.rebuild_blocked_cache(true)?;
-
-    // Step 11: Update metadata
-    storage.set_metadata(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
-    let jsonl_hash = compute_jsonl_hash(input_path)?;
-    storage.set_metadata(METADATA_JSONL_CONTENT_HASH, &jsonl_hash)?;
-    Ok(result)
 }
 
 /// Process a single import action.
@@ -2969,6 +3013,7 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueType, Priority, Status};
     use chrono::Utc;
+    use fsqlite_types::SqliteValue;
     use indicatif::{ProgressBar, ProgressStyle};
     use std::io::{self, Write};
     use tempfile::TempDir;
@@ -3626,6 +3671,82 @@ mod tests {
         let config = ImportConfig::default();
         let result = import_from_jsonl(&mut storage, &path, &config, Some("test-")).unwrap();
         assert_eq!(result.imported_count, 1);
+    }
+
+    #[test]
+    fn test_import_restores_foreign_keys_after_relation_sync_failure() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let issue = make_test_issue("test-001", "Broken relations");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        storage.execute_test_sql("DROP TABLE comments;").unwrap();
+
+        let err = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("comments"),
+            "unexpected error: {err}"
+        );
+
+        let fk_enabled = storage
+            .execute_raw_query("PRAGMA foreign_keys")
+            .unwrap()
+            .first()
+            .and_then(|row| row.first())
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        assert_eq!(fk_enabled, 1, "foreign key enforcement should be restored");
+    }
+
+    #[test]
+    fn test_import_rolls_back_partial_changes_after_relation_sync_failure() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("issues.jsonl");
+
+        let existing = make_test_issue("test-existing", "Existing issue");
+        storage.create_issue(&existing, "test").unwrap();
+        storage
+            .set_export_hashes(&[("test-existing".to_string(), "existing-hash".to_string())])
+            .unwrap();
+
+        let issue = make_test_issue("test-001", "Broken relations");
+        let json = serde_json::to_string(&issue).unwrap();
+        fs::write(&path, format!("{json}\n")).unwrap();
+
+        storage.execute_test_sql("DROP TABLE comments;").unwrap();
+
+        let err = import_from_jsonl(&mut storage, &path, &ImportConfig::default(), Some("test-"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("comments"),
+            "unexpected error: {err}"
+        );
+
+        assert!(
+            storage.get_issue("test-001").unwrap().is_none(),
+            "failed import should not leave a partially inserted issue behind"
+        );
+        assert!(
+            storage.get_issue("test-existing").unwrap().is_some(),
+            "failed import should preserve pre-existing issues"
+        );
+
+        let export_hash_rows = storage
+            .execute_raw_query("SELECT issue_id, content_hash FROM export_hashes")
+            .unwrap();
+        assert_eq!(export_hash_rows.len(), 1, "export hashes should roll back");
+        assert_eq!(
+            export_hash_rows[0]
+                .first()
+                .and_then(SqliteValue::as_text)
+                .unwrap_or(""),
+            "test-existing"
+        );
     }
 
     #[test]

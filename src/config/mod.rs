@@ -15,8 +15,8 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority};
 use crate::storage::SqliteStorage;
 use crate::sync::{
-    ExportConfig, ImportConfig, export_to_jsonl_with_policy, finalize_export, import_from_jsonl,
-    preflight_import,
+    ExportConfig, ImportConfig, ImportResult, export_to_jsonl_with_policy, finalize_export,
+    import_from_jsonl, preflight_import,
 };
 use crate::util::id::IdConfig;
 use chrono::Utc;
@@ -354,50 +354,48 @@ fn rebuild_database_from_jsonl(
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
 ) -> Result<SqliteStorage> {
-    let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, &paths.jsonl_path)?;
-    let import_config = import_config_for_resolved_jsonl(beads_dir, &paths.jsonl_path);
+    repair_database_from_jsonl(
+        beads_dir,
+        &paths.db_path,
+        &paths.jsonl_path,
+        lock_timeout,
+        bootstrap_layer,
+        false,
+    )
+    .map(|(storage, _)| storage)
+}
 
-    preflight_import(&paths.jsonl_path, &import_config, Some(&prefix))?.into_result()?;
+pub(crate) fn repair_database_from_jsonl(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    lock_timeout: Option<u64>,
+    bootstrap_layer: &ConfigLayer,
+    show_progress: bool,
+) -> Result<(SqliteStorage, ImportResult)> {
+    let prefix = resolve_bootstrap_issue_prefix(bootstrap_layer, beads_dir, jsonl_path)?;
+    let mut import_config = import_config_for_resolved_jsonl(beads_dir, jsonl_path);
+    import_config.show_progress = show_progress;
+
+    preflight_import(jsonl_path, &import_config, Some(&prefix))?.into_result()?;
 
     warn!(
-        db_path = %paths.db_path.display(),
-        jsonl_path = %paths.jsonl_path.display(),
-        "Database open failed; rebuilding SQLite database from JSONL"
+        db_path = %db_path.display(),
+        jsonl_path = %jsonl_path.display(),
+        "Rebuilding SQLite database from JSONL"
     );
 
-    let backup_set = backup_database_family_for_recovery(&paths.db_path, beads_dir)?;
-    match rebuild_database_family(
-        &paths.db_path,
-        lock_timeout,
-        &paths.jsonl_path,
-        &import_config,
-        &prefix,
-    ) {
-        Ok(storage) => {
-            warn!(
-                db_path = %paths.db_path.display(),
-                recovery_dir = %backup_set.recovery_dir.display(),
-                "Automatic database recovery from JSONL succeeded"
-            );
-            Ok(storage)
-        }
-        Err(recovery_err) => {
-            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
-                warn!(
-                    db_path = %paths.db_path.display(),
-                    recovery_dir = %backup_set.recovery_dir.display(),
-                    restore_error = %restore_err,
-                    "Failed to restore original database after unsuccessful rebuild"
-                );
-                return Err(recovery_restore_failure(
-                    &backup_set,
-                    &recovery_err,
-                    restore_err,
-                ));
-            }
-            Err(recovery_err)
-        }
-    }
+    let ((storage, import_result), recovery_dir) =
+        rebuild_database_family_with_backup(db_path, beads_dir, || {
+            rebuild_database_family(db_path, lock_timeout, jsonl_path, &import_config, &prefix)
+        })?;
+
+    warn!(
+        db_path = %db_path.display(),
+        recovery_dir = %recovery_dir.display(),
+        "SQLite rebuild from JSONL succeeded"
+    );
+    Ok((storage, import_result))
 }
 
 fn should_surface_recovery_error(recovery_err: &BeadsError) -> bool {
@@ -424,11 +422,43 @@ fn rebuild_database_family(
     jsonl_path: &Path,
     import_config: &ImportConfig,
     prefix: &str,
-) -> Result<SqliteStorage> {
+) -> Result<(SqliteStorage, ImportResult)> {
     let mut storage = SqliteStorage::open_with_timeout(db_path, lock_timeout)?;
     storage.set_config("issue_prefix", prefix)?;
-    import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
-    Ok(storage)
+    let import_result = import_from_jsonl(&mut storage, jsonl_path, import_config, Some(prefix))?;
+    Ok((storage, import_result))
+}
+
+pub(crate) fn rebuild_database_family_with_backup<T, F>(
+    db_path: &Path,
+    beads_dir: &Path,
+    rebuild: F,
+) -> Result<(T, PathBuf)>
+where
+    F: FnOnce() -> Result<T>,
+{
+    let backup_set = backup_database_family_for_recovery(db_path, beads_dir)?;
+    let recovery_dir = backup_set.recovery_dir.clone();
+
+    match rebuild() {
+        Ok(value) => Ok((value, recovery_dir)),
+        Err(rebuild_err) => {
+            if let Err(restore_err) = restore_database_family_after_failed_rebuild(&backup_set) {
+                warn!(
+                    db_path = %db_path.display(),
+                    recovery_dir = %backup_set.recovery_dir.display(),
+                    restore_error = %restore_err,
+                    "Failed to restore original database after unsuccessful rebuild"
+                );
+                return Err(recovery_restore_failure(
+                    &backup_set,
+                    &rebuild_err,
+                    restore_err,
+                ));
+            }
+            Err(rebuild_err)
+        }
+    }
 }
 
 fn backup_database_family_for_recovery(

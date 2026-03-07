@@ -8,7 +8,6 @@ use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
 use clap_complete::CompleteEnv;
 use std::io::{self, IsTerminal};
-use std::path::Path;
 use tracing::debug;
 
 #[allow(clippy::too_many_lines)]
@@ -233,7 +232,7 @@ const fn should_render_errors_as_json(cli: &Cli) -> bool {
 /// Run auto-import before read-only commands when JSONL is newer.
 fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Result<()> {
     // If not initialized, skip auto-import (e.g. running 'br init')
-    let beads_dir = match config::discover_beads_dir(Some(Path::new("."))) {
+    let beads_dir = match config::discover_beads_dir_with_cli(overrides) {
         Ok(dir) => dir,
         Err(BeadsError::NotInitialized) => return Ok(()),
         Err(e) => return Err(e),
@@ -290,7 +289,7 @@ fn run_auto_import(overrides: &config::CliOverrides, allow_stale: bool) -> Resul
 /// and exports any dirty issues to JSONL.
 fn run_auto_flush(overrides: &config::CliOverrides) {
     // Try to discover beads directory
-    let beads_dir = match config::discover_beads_dir(Some(Path::new("."))) {
+    let beads_dir = match config::discover_beads_dir_with_cli(overrides) {
         Ok(dir) => dir,
         Err(e) => {
             debug!(
@@ -315,7 +314,7 @@ fn run_auto_flush(overrides: &config::CliOverrides) {
     }
 
     // Open storage with fresh connection
-    let (mut storage, _paths) =
+    let (mut storage, paths) =
         match config::open_storage(&beads_dir, overrides.db.as_ref(), overrides.lock_timeout) {
             Ok(result) => result,
             Err(e) => {
@@ -325,7 +324,7 @@ fn run_auto_flush(overrides: &config::CliOverrides) {
         };
 
     // Run auto-flush
-    match auto_flush(&mut storage, &beads_dir) {
+    match auto_flush(&mut storage, &paths.beads_dir, &paths.jsonl_path) {
         Ok(result) => {
             if result.flushed {
                 debug!(

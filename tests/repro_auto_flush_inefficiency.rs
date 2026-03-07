@@ -24,6 +24,7 @@ fn test_auto_flush_optimizes_no_content_change() {
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
 
     let mut storage = SqliteStorage::open(&db_path).unwrap();
 
@@ -32,7 +33,7 @@ fn test_auto_flush_optimizes_no_content_change() {
     storage.create_issue(&issue, "tester").unwrap();
 
     // 2. First auto-flush (should export)
-    let result = auto_flush(&mut storage, &beads_dir).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
     assert!(result.flushed, "First flush should happen");
     assert_eq!(result.exported_count, 1);
 
@@ -64,7 +65,7 @@ fn test_auto_flush_optimizes_no_content_change() {
 
     // 4. Second auto-flush (should SKIP export because content hash hasn't changed)
     // CURRENTLY THIS FAILS (it flushes) - Update: We ACCEPT this inefficiency for correctness (label sync)
-    let result = auto_flush(&mut storage, &beads_dir).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
 
     // Inefficiency documentation: We flush even if content hash is unchanged
     assert!(
@@ -83,6 +84,7 @@ fn test_auto_flush_flush_on_label_change() {
     let beads_dir = temp_dir.path().join(".beads");
     fs::create_dir(&beads_dir).unwrap();
     let db_path = beads_dir.join("beads.db");
+    let jsonl_path = beads_dir.join("issues.jsonl");
 
     let mut storage = SqliteStorage::open(&db_path).unwrap();
 
@@ -91,7 +93,7 @@ fn test_auto_flush_flush_on_label_change() {
     storage.create_issue(&issue, "tester").unwrap();
 
     // 2. First auto-flush
-    let result = auto_flush(&mut storage, &beads_dir).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
     assert!(result.flushed);
 
     // 3. Add a label
@@ -102,8 +104,26 @@ fn test_auto_flush_flush_on_label_change() {
     assert_eq!(dirty_ids.len(), 1);
 
     // 4. Second auto-flush - SHOULD FLUSH because label was added
-    let result = auto_flush(&mut storage, &beads_dir).unwrap();
+    let result = auto_flush(&mut storage, &beads_dir, &jsonl_path).unwrap();
 
     // This assertion will FAIL if my optimization is active and flawed
     assert!(result.flushed, "Should flush when label is added");
+}
+
+#[test]
+fn test_auto_flush_uses_resolved_jsonl_path() {
+    let temp_dir = TempDir::new().unwrap();
+    let beads_dir = temp_dir.path().join(".beads");
+    fs::create_dir(&beads_dir).unwrap();
+    let db_path = beads_dir.join("beads.db");
+    let custom_jsonl_path = temp_dir.path().join("custom-issues.jsonl");
+
+    let mut storage = SqliteStorage::open(&db_path).unwrap();
+    storage.create_issue(&make_issue("bd-1"), "tester").unwrap();
+
+    let result = auto_flush(&mut storage, &beads_dir, &custom_jsonl_path).unwrap();
+
+    assert!(result.flushed);
+    assert!(custom_jsonl_path.exists());
+    assert!(!beads_dir.join("issues.jsonl").exists());
 }

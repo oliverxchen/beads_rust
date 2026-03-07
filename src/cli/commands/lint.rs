@@ -271,10 +271,10 @@ fn resolve_issues(
 
     let mut issues = Vec::new();
     for id_input in &args.ids {
-        let resolution = resolver.resolve(
+        let resolution = resolver.resolve_fallible(
             id_input,
-            |id| storage.id_exists(id).unwrap_or(false),
-            |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
+            |id| storage.id_exists(id),
+            |hash| storage.find_ids_by_hash(hash),
         )?;
 
         match storage.get_issue(&resolution.id)? {

@@ -45,10 +45,10 @@ pub fn execute(
 
     let mut details_list = Vec::new();
     for id_input in target_ids {
-        let resolution = resolver.resolve(
+        let resolution = resolver.resolve_fallible(
             &id_input,
-            |id| storage.id_exists(id).unwrap_or(false),
-            |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
+            |id| storage.id_exists(id),
+            |hash| storage.find_ids_by_hash(hash),
         )?;
 
         // Fetch full details including comments and events

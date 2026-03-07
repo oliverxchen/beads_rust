@@ -4,9 +4,10 @@ use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata};
 use crate::model::{Comment, DependencyType, Event, EventType, Issue, IssueType, Priority, Status};
 use crate::storage::events::get_events;
+#[cfg(test)]
+use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    CURRENT_SCHEMA_VERSION, apply_runtime_compatible_schema, apply_runtime_pragmas, apply_schema,
-    runtime_schema_compatible,
+    apply_runtime_compatible_schema, apply_schema, runtime_schema_compatible,
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use fsqlite::Connection;
@@ -115,20 +116,10 @@ impl SqliteStorage {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
 
-        #[allow(clippy::cast_possible_truncation)]
-        let user_version = conn
-            .query_row("PRAGMA user_version")
-            .ok()
-            .and_then(|r| r.get(0).and_then(SqliteValue::as_integer))
-            .unwrap_or(0) as i32;
-        if user_version < CURRENT_SCHEMA_VERSION {
-            if runtime_schema_compatible(&conn) {
-                apply_runtime_compatible_schema(&conn)?;
-            } else {
-                apply_schema(&conn)?;
-            }
+        if runtime_schema_compatible(&conn) {
+            apply_runtime_compatible_schema(&conn)?;
         } else {
-            apply_runtime_pragmas(&conn)?;
+            apply_schema(&conn)?;
         }
         Ok(Self {
             conn,
@@ -181,6 +172,37 @@ impl SqliteStorage {
     pub(crate) fn execute_raw_count(&self, sql: &str) -> Result<usize> {
         let rows = self.conn.execute(sql)?;
         Ok(rows)
+    }
+
+    /// Set export hashes using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn set_export_hashes_in_tx(&self, exports: &[(String, String)]) -> Result<usize> {
+        if exports.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let mut count = 0;
+        for (issue_id, content_hash) in exports {
+            self.conn.execute_with_params(
+                "DELETE FROM export_hashes WHERE issue_id = ?",
+                &[SqliteValue::from(issue_id.as_str())],
+            )?;
+            self.conn.execute_with_params(
+                "INSERT INTO export_hashes (issue_id, content_hash, exported_at) VALUES (?, ?, ?)",
+                &[
+                    SqliteValue::from(issue_id.as_str()),
+                    SqliteValue::from(content_hash.as_str()),
+                    SqliteValue::from(now.as_str()),
+                ],
+            )?;
+            count += 1;
+        }
+
+        Ok(count)
     }
 
     /// Attempt a WAL checkpoint (TRUNCATE mode) to flush WAL back to the main
@@ -548,12 +570,12 @@ impl SqliteStorage {
             // Atomic claim guard: check assignee INSIDE the CONCURRENT transaction
             // to prevent TOCTOU races where two agents both see "unassigned".
             if updates.expect_unassigned {
-                let current_assignee: Option<String> = conn
-                    .query_row_with_params(
-                        "SELECT assignee FROM issues WHERE id = ?",
-                        &[SqliteValue::from(id)],
-                    )
-                    .ok()
+                let rows = conn.query_with_params(
+                    "SELECT assignee FROM issues WHERE id = ?",
+                    &[SqliteValue::from(id)],
+                )?;
+                let current_assignee: Option<String> = rows
+                    .first()
                     .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
                 let trimmed = current_assignee
                     .as_deref()
@@ -825,10 +847,14 @@ impl SqliteStorage {
 
         let original_type = issue.issue_type.as_str().to_string();
         let timestamp = deleted_at.unwrap_or_else(Utc::now);
+        let mut tombstone_issue = issue.clone();
+        tombstone_issue.status = Status::Tombstone;
+        let tombstone_hash = crate::util::content_hash(&tombstone_issue);
 
         self.mutate("delete_issue", actor, |conn, ctx| {
             conn.execute_with_params(
                 "UPDATE issues SET
+                    content_hash = ?,
                     status = 'tombstone',
                     deleted_at = ?,
                     deleted_by = ?,
@@ -837,6 +863,7 @@ impl SqliteStorage {
                     updated_at = ?
                  WHERE id = ?",
                 &[
+                    SqliteValue::from(tombstone_hash.as_str()),
                     SqliteValue::from(timestamp.to_rfc3339()),
                     SqliteValue::from(actor),
                     SqliteValue::from(reason),
@@ -892,17 +919,8 @@ impl SqliteStorage {
                 "DELETE FROM dependencies WHERE depends_on_id = ?",
                 &[SqliteValue::from(id)],
             )?;
-            conn.execute_with_params(
-                "DELETE FROM issues WHERE id = ?",
-                &[SqliteValue::from(id)],
-            )?;
+            conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
 
-            ctx.record_event(
-                EventType::Deleted,
-                id,
-                Some("Hard-deleted (purged from DB and JSONL)".to_string()),
-            );
-            ctx.mark_dirty(id);
             ctx.invalidate_cache();
 
             Ok(())
@@ -1518,32 +1536,21 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
-        let json_opt: Option<String> = self
-            .conn
-            .query_row_with_params(
-                "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
-                &[SqliteValue::from(issue_id)],
-            )
-            .ok()
-            .and_then(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from));
+        let rows = self.conn.query_with_params(
+            "SELECT blocked_by FROM blocked_issues_cache WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        let Some(row) = rows.first() else {
+            return Ok(Vec::new());
+        };
 
-        match json_opt {
-            Some(json) => {
-                let blockers: Vec<String> = match serde_json::from_str(&json) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("warn: malformed blocked_by JSON for {issue_id}: {e}");
-                        return Ok(Vec::new());
-                    }
-                };
-                // Extract just the issue IDs (strip status annotations like ":open")
-                Ok(blockers
-                    .into_iter()
-                    .map(|b| b.split(':').next().unwrap_or(&b).to_string())
-                    .collect())
-            }
-            None => Ok(Vec::new()),
-        }
+        let blockers = parse_blocked_by_json(issue_id, row.get(0).and_then(SqliteValue::as_text))?;
+
+        // Extract just the issue IDs (strip status annotations like ":open")
+        Ok(blockers
+            .into_iter()
+            .map(|b| b.split(':').next().unwrap_or(&b).to_string())
+            .collect())
     }
 
     /// Rebuild the blocked issues cache from scratch.
@@ -1577,6 +1584,15 @@ impl SqliteStorage {
                 Err(e)
             }
         }
+    }
+
+    /// Rebuild the blocked cache using the caller's active transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the rebuild fails.
+    pub(crate) fn rebuild_blocked_cache_in_tx(&self) -> Result<usize> {
+        Self::rebuild_blocked_cache_impl(&self.conn)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1767,8 +1783,8 @@ impl SqliteStorage {
         let mut blocked_issues = Vec::new();
         for row in &rows {
             let issue = Self::issue_from_row(row)?;
-            let blockers_json = row.get(36).and_then(SqliteValue::as_text).unwrap_or("[]");
-            let blockers: Vec<String> = serde_json::from_str(blockers_json).unwrap_or_default();
+            let blockers =
+                parse_blocked_by_json(&issue.id, row.get(36).and_then(SqliteValue::as_text))?;
             blocked_issues.push((issue, blockers));
         }
 
@@ -3666,14 +3682,14 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub fn set_metadata_in_tx(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    pub(crate) fn set_metadata_in_tx(&self, key: &str, value: &str) -> Result<()> {
         // Explicit DELETE + INSERT instead of INSERT OR REPLACE because
         // fsqlite does not enforce UNIQUE constraints on non-rowid columns.
-        conn.execute_with_params(
+        self.conn.execute_with_params(
             "DELETE FROM metadata WHERE key = ?",
             &[SqliteValue::from(key)],
         )?;
-        conn.execute_with_params(
+        self.conn.execute_with_params(
             "INSERT INTO metadata (key, value) VALUES (?, ?)",
             &[SqliteValue::from(key), SqliteValue::from(value)],
         )?;
@@ -3685,8 +3701,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if the database operation fails.
-    pub fn clear_all_export_hashes_in_tx(conn: &Connection) -> Result<usize> {
-        let count = conn.execute("DELETE FROM export_hashes")?;
+    pub(crate) fn clear_all_export_hashes_in_tx(&self) -> Result<usize> {
+        let count = self.conn.execute("DELETE FROM export_hashes")?;
         Ok(count)
     }
 }
@@ -3819,6 +3835,18 @@ fn parse_status(s: Option<&str>) -> Status {
 
 fn parse_issue_type(s: Option<&str>) -> IssueType {
     s.and_then(|s| s.parse().ok()).unwrap_or_default()
+}
+
+fn parse_blocked_by_json(issue_id: &str, blockers_json: Option<&str>) -> Result<Vec<String>> {
+    let blockers_json = blockers_json.ok_or_else(|| {
+        BeadsError::Config(format!(
+            "blocked_issues_cache missing blocked_by payload for {issue_id}"
+        ))
+    })?;
+
+    serde_json::from_str(blockers_json).map_err(|err| {
+        BeadsError::Config(format!("Malformed blocked_by JSON for {issue_id}: {err}"))
+    })
 }
 
 fn parse_external_dependency(dep_id: &str) -> Option<(String, String)> {
@@ -4277,36 +4305,36 @@ impl SqliteStorage {
                 SqliteValue::from(issue.id.as_str()),
                 issue.content_hash.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 SqliteValue::from(issue.title.as_str()),
-                issue.description.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.description.as_deref().unwrap_or("")),
                 SqliteValue::from(issue.design.as_deref().unwrap_or("")),
                 SqliteValue::from(issue.acceptance_criteria.as_deref().unwrap_or("")),
-                issue.notes.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.notes.as_deref().unwrap_or("")),
                 SqliteValue::from(status_str),
                 SqliteValue::from(i64::from(issue.priority.0)),
                 SqliteValue::from(issue_type_str),
                 issue.assignee.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.owner.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.owner.as_deref().unwrap_or("")),
                 issue.estimated_minutes.map_or(SqliteValue::Null, |v| SqliteValue::from(i64::from(v))),
                 SqliteValue::from(created_at_str.as_str()),
-                issue.created_by.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.created_by.as_deref().unwrap_or("")),
                 SqliteValue::from(updated_at_str.as_str()),
                 closed_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.close_reason.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.closed_by_session.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.close_reason.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.closed_by_session.as_deref().unwrap_or("")),
                 due_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 defer_until_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 issue.external_ref.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.source_system.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.source_system.as_deref().unwrap_or("")),
                 SqliteValue::from(issue.source_repo.as_deref().unwrap_or(".")),
                 deleted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.deleted_by.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.delete_reason.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
-                issue.original_type.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.deleted_by.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.delete_reason.as_deref().unwrap_or("")),
+                SqliteValue::from(issue.original_type.as_deref().unwrap_or("")),
                 SqliteValue::from(i64::from(issue.compaction_level.unwrap_or(0))),
                 compacted_at_str.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 issue.compacted_at_commit.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
                 SqliteValue::from(i64::from(issue.original_size.unwrap_or(0))),
-                issue.sender.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                SqliteValue::from(issue.sender.as_deref().unwrap_or("")),
                 SqliteValue::from(i64::from(i32::from(issue.ephemeral))),
                 SqliteValue::from(i64::from(i32::from(issue.pinned))),
                 SqliteValue::from(i64::from(i32::from(issue.is_template))),
@@ -4772,6 +4800,58 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_issue_recomputes_content_hash_for_tombstone() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-d2", "Delete me too", Status::Open, 2, None, t1, None);
+        let original_hash = issue.content_hash.clone();
+        storage.create_issue(&issue, "tester").unwrap();
+
+        let deleted = storage
+            .delete_issue("bd-d2", "tester", "cleanup", None)
+            .unwrap();
+
+        assert_eq!(deleted.status, Status::Tombstone);
+        assert_ne!(deleted.content_hash, original_hash);
+        assert_eq!(
+            deleted.content_hash.as_deref(),
+            Some(crate::util::content_hash(&deleted).as_str())
+        );
+    }
+
+    #[test]
+    fn test_purge_issue_succeeds_without_fk_side_effects() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+
+        let issue = make_issue("bd-p1", "Purge me", Status::Open, 2, None, t1, None);
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage.purge_issue("bd-p1", "tester").unwrap();
+
+        assert!(storage.get_issue("bd-p1").unwrap().is_none());
+
+        let dirty_count = storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM dirty_issues WHERE issue_id = 'bd-p1'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        assert_eq!(dirty_count, 0);
+
+        let event_count = storage
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE issue_id = 'bd-p1'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
     fn test_get_blocked_issues_lists_blockers() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 4, 1, 0, 0, 0).unwrap();
@@ -5182,6 +5262,70 @@ mod tests {
     }
 
     #[test]
+    fn test_get_blockers_errors_on_malformed_cache_json() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
+                &[SqliteValue::from("bd-c1"), SqliteValue::from("not-json")],
+            )
+            .unwrap();
+
+        let err = storage.get_blockers("bd-c1").unwrap_err();
+        match err {
+            BeadsError::Config(msg) => {
+                assert!(msg.contains("Malformed blocked_by JSON"));
+                assert!(msg.contains("bd-c1"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_get_blocked_issues_errors_on_malformed_cache_json() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-c1",
+            "Blocked issue",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .conn
+            .execute_with_params(
+                "INSERT INTO blocked_issues_cache (issue_id, blocked_by) VALUES (?, ?)",
+                &[SqliteValue::from("bd-c1"), SqliteValue::from("not-json")],
+            )
+            .unwrap();
+
+        let err = storage.get_blocked_issues().unwrap_err();
+        match err {
+            BeadsError::Config(msg) => {
+                assert!(msg.contains("Malformed blocked_by JSON"));
+                assert!(msg.contains("bd-c1"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_update_issue_recomputes_hash() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let mut issue = make_issue(
@@ -5330,6 +5474,46 @@ mod tests {
     }
 
     #[test]
+    fn test_open_repairs_missing_canonical_indexes_even_when_user_version_is_current() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("current_version_missing_index.db");
+
+        {
+            let storage = SqliteStorage::open(&db_path).unwrap();
+            storage
+                .conn
+                .execute("DROP INDEX IF EXISTS idx_issues_external_ref_unique")
+                .unwrap();
+        }
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let user_version = reopened
+            .conn
+            .query_row("PRAGMA user_version")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert_eq!(
+            user_version,
+            i64::from(CURRENT_SCHEMA_VERSION),
+            "reopen should preserve the current schema version"
+        );
+
+        let indexes: HashSet<String> = reopened
+            .conn
+            .query("SELECT name FROM sqlite_master WHERE type='index'")
+            .unwrap()
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_owned))
+            .collect();
+        assert!(
+            indexes.contains("idx_issues_external_ref_unique"),
+            "reopen should recreate missing canonical indexes even when user_version is already current"
+        );
+    }
+
+    #[test]
     fn test_open_repairs_legacy_kv_primary_key_tables() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("legacy_kv_primary_keys.db");
@@ -5437,15 +5621,48 @@ mod tests {
         let row = storage
             .conn
             .query_row_with_params(
-                "SELECT typeof(design), typeof(acceptance_criteria), design, acceptance_criteria FROM issues WHERE id = ?",
+                "SELECT
+                    typeof(description), typeof(design), typeof(acceptance_criteria), typeof(notes),
+                    typeof(owner), typeof(created_by), typeof(close_reason), typeof(closed_by_session),
+                    typeof(source_system), typeof(source_repo), typeof(deleted_by), typeof(delete_reason),
+                    typeof(original_type), typeof(sender),
+                    description, design, acceptance_criteria, notes, owner, created_by, close_reason,
+                    closed_by_session, source_system, source_repo, deleted_by, delete_reason,
+                    original_type, sender
+                 FROM issues WHERE id = ?",
                 &[SqliteValue::from(issue.id.as_str())],
             )
             .unwrap();
 
-        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("text"));
-        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("text"));
-        assert_eq!(row.get(2).and_then(SqliteValue::as_text), Some(""));
-        assert_eq!(row.get(3).and_then(SqliteValue::as_text), Some(""));
+        for index in 0..14 {
+            assert_eq!(
+                row.get(index).and_then(SqliteValue::as_text),
+                Some("text"),
+                "column {index} should store an empty string, not NULL"
+            );
+        }
+
+        for index in 14..23 {
+            assert_eq!(
+                row.get(index).and_then(SqliteValue::as_text),
+                Some(""),
+                "column {index} should coalesce missing optional text to ''"
+            );
+        }
+
+        assert_eq!(
+            row.get(23).and_then(SqliteValue::as_text),
+            Some("."),
+            "source_repo should coalesce missing values to '.'"
+        );
+
+        for index in 24..28 {
+            assert_eq!(
+                row.get(index).and_then(SqliteValue::as_text),
+                Some(""),
+                "column {index} should coalesce missing optional text to ''"
+            );
+        }
     }
 
     #[test]

@@ -83,14 +83,13 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     let storage_ctx = config::open_storage_with_cli(&beads_dir, cli)?;
     let db_path = canonicalize_lossy(&storage_ctx.paths.db_path);
 
-    let issue_count = storage_ctx.storage.count_issues().ok();
-    let config_map = storage_ctx
-        .storage
-        .get_all_config()
-        .ok()
-        .filter(|map| !map.is_empty());
+    let issue_count = Some(storage_ctx.storage.count_issues()?);
+    let config_map = Some(storage_ctx.storage.get_all_config()?).filter(|map| !map.is_empty());
     let schema = if args.schema {
-        Some(build_schema_info(&storage_ctx.storage, config_map.as_ref()))
+        Some(build_schema_info(
+            &storage_ctx.storage,
+            config_map.as_ref(),
+        )?)
     } else {
         None
     };
@@ -139,8 +138,8 @@ pub fn execute(args: &InfoArgs, cli: &config::CliOverrides, ctx: &OutputContext)
 fn build_schema_info(
     storage: &SqliteStorage,
     config_map: Option<&HashMap<String, String>>,
-) -> SchemaInfo {
-    let mut ids = storage.get_all_ids().unwrap_or_default();
+) -> Result<SchemaInfo> {
+    let mut ids = storage.get_all_ids()?;
     let sample_issue_ids: Vec<String> = ids.drain(..ids.len().min(3)).collect();
 
     let mut detected_prefix = config_map
@@ -153,13 +152,13 @@ fn build_schema_info(
             .and_then(|id| parse_id(id).ok().map(|parsed| parsed.prefix));
     }
 
-    SchemaInfo {
+    Ok(SchemaInfo {
         tables: SCHEMA_TABLES.iter().map(ToString::to_string).collect(),
         schema_version: CURRENT_SCHEMA_VERSION.to_string(),
         config: config_map.cloned(),
         sample_issue_ids,
         detected_prefix,
-    }
+    })
 }
 
 fn print_human(info: &InfoOutput) {

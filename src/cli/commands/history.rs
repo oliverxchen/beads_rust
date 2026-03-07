@@ -4,10 +4,9 @@ use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
 use crate::sync::history;
-use chrono::NaiveDateTime;
 use rich_rust::prelude::*;
 use serde_json::json;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Result type for diff status: (status_string, diff_available, optional_size_tuple).
 type DiffStatusResult = (&'static str, bool, Option<(u64, u64)>);
@@ -135,14 +134,15 @@ fn diff_backup(
     filename: &str,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let backup_path = history_dir.join(filename);
+    let backup_name = validated_backup_filename(filename)?;
+    let backup_path = history_dir.join(&backup_name);
     if !backup_path.exists() {
         return Err(BeadsError::Config(format!(
-            "Backup file not found: {filename}"
+            "Backup file not found: {backup_name}"
         )));
     }
 
-    let current_path = current_jsonl_path_for_backup(beads_dir, filename)?;
+    let current_path = current_jsonl_path_for_backup(beads_dir, &backup_name)?;
     let current_name = current_path
         .file_name()
         .unwrap_or_default()
@@ -159,7 +159,7 @@ fn diff_backup(
             diff_status_for_json(&current_path, &backup_path)?;
         let output = json!({
             "action": "diff",
-            "backup": filename,
+            "backup": backup_name,
             "current": current_path.display().to_string(),
             "status": status_label,
             "diff_available": diff_available,
@@ -242,14 +242,15 @@ fn restore_backup(
     force: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
-    let backup_path = history_dir.join(filename);
+    let backup_name = validated_backup_filename(filename)?;
+    let backup_path = history_dir.join(&backup_name);
     if !backup_path.exists() {
         return Err(BeadsError::Config(format!(
-            "Backup file not found: {filename}"
+            "Backup file not found: {backup_name}"
         )));
     }
 
-    let target_path = current_jsonl_path_for_backup(beads_dir, filename)?;
+    let target_path = current_jsonl_path_for_backup(beads_dir, &backup_name)?;
     let target_name = target_path
         .file_name()
         .unwrap_or_default()
@@ -262,13 +263,14 @@ fn restore_backup(
         )));
     }
 
-    // Copy backup to the corresponding JSONL file stem.
-    std::fs::copy(&backup_path, &target_path)?;
+    let temp_path = target_path.with_file_name(format!("{target_name}.restore.tmp"));
+    std::fs::copy(&backup_path, &temp_path)?;
+    std::fs::rename(&temp_path, &target_path)?;
 
     if ctx.is_json() {
         let output = json!({
             "action": "restore",
-            "backup": filename,
+            "backup": backup_name,
             "target": target_path.display().to_string(),
             "restored": true,
             "next_step": "br sync --import-only --force",
@@ -283,15 +285,16 @@ fn restore_backup(
 
     if ctx.is_rich() {
         let theme = ctx.theme();
-        let body =
-            format!("Restored {filename} to {target_name}.\nNext: br sync --import-only --force");
+        let body = format!(
+            "Restored {backup_name} to {target_name}.\nNext: br sync --import-only --force"
+        );
         let panel = Panel::from_text(&body)
             .title(Text::styled("History Restore", theme.panel_title.clone()))
             .box_style(theme.box_style)
             .border_style(theme.panel_border.clone());
         ctx.render(&panel);
     } else {
-        println!("Restored {filename} to {target_name}");
+        println!("Restored {backup_name} to {target_name}");
         println!("Run 'br sync --import-only --force' to import this state into the database.");
     }
 
@@ -370,24 +373,28 @@ fn diff_status_for_json(current_path: &Path, backup_path: &Path) -> Result<DiffS
 }
 
 fn current_jsonl_path_for_backup(beads_dir: &Path, filename: &str) -> Result<PathBuf> {
-    let Some(without_ext) = filename.strip_suffix(".jsonl") else {
+    let backup_name = validated_backup_filename(filename)?;
+    let Some((stem, _timestamp)) = history::parse_backup_filename(&backup_name) else {
         return Err(BeadsError::Config(format!(
-            "Invalid backup filename format: {filename}"
+            "Invalid backup filename format: {backup_name}"
         )));
     };
-    let Some((stem, timestamp)) = without_ext.rsplit_once('.') else {
-        return Err(BeadsError::Config(format!(
-            "Invalid backup filename format: {filename}"
-        )));
-    };
-
-    if stem.is_empty() || NaiveDateTime::parse_from_str(timestamp, "%Y%m%d_%H%M%S").is_err() {
-        return Err(BeadsError::Config(format!(
-            "Invalid backup filename format: {filename}"
-        )));
-    }
 
     Ok(beads_dir.join(format!("{stem}.jsonl")))
+}
+
+fn validated_backup_filename(filename: &str) -> Result<String> {
+    let mut components = Path::new(filename).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) => {
+            name.to_str().map(str::to_string).ok_or_else(|| {
+                BeadsError::Config(format!("Invalid backup filename format: {filename}"))
+            })
+        }
+        _ => Err(BeadsError::Config(format!(
+            "Invalid backup filename format: {filename}"
+        ))),
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -429,10 +436,33 @@ mod tests {
     }
 
     #[test]
+    fn test_current_jsonl_path_for_backup_high_precision_timestamp() {
+        let temp = TempDir::new().unwrap();
+        let path = current_jsonl_path_for_backup(
+            temp.path(),
+            "issues.snapshot.20260220_120000_123456.1.jsonl",
+        )
+        .unwrap();
+        assert_eq!(path, temp.path().join("issues.snapshot.jsonl"));
+    }
+
+    #[test]
     fn test_current_jsonl_path_for_backup_rejects_invalid_name() {
         let temp = TempDir::new().unwrap();
         let err =
             current_jsonl_path_for_backup(temp.path(), "issues.not-a-timestamp.jsonl").unwrap_err();
+
+        match err {
+            BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_current_jsonl_path_for_backup_rejects_path_traversal() {
+        let temp = TempDir::new().unwrap();
+        let err = current_jsonl_path_for_backup(temp.path(), "../issues.20260220_120000.jsonl")
+            .unwrap_err();
 
         match err {
             BeadsError::Config(msg) => assert!(msg.contains("Invalid backup filename format")),

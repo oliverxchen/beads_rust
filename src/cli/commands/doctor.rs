@@ -6,10 +6,8 @@ use crate::cli::DoctorArgs;
 use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
-use crate::storage::SqliteStorage;
 use crate::sync::{
-    ImportConfig, OrphanMode, PathValidation, import_from_jsonl, scan_conflict_markers,
-    validate_no_git_path, validate_sync_path,
+    PathValidation, scan_conflict_markers, validate_no_git_path, validate_sync_path,
 };
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -44,6 +42,13 @@ struct DoctorReport {
     checks: Vec<CheckResult>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+struct DoctorRepairResult {
+    imported: usize,
+    skipped: usize,
+    fk_violations_cleaned: usize,
+}
+
 fn push_check(
     checks: &mut Vec<CheckResult>,
     name: &str,
@@ -63,6 +68,68 @@ fn has_error(checks: &[CheckResult]) -> bool {
     checks
         .iter()
         .any(|check| matches!(check.status, CheckStatus::Error))
+}
+
+fn repair_database_from_jsonl(
+    beads_dir: &Path,
+    db_path: &Path,
+    jsonl_path: &Path,
+    cli: &config::CliOverrides,
+    show_progress: bool,
+) -> Result<DoctorRepairResult> {
+    let bootstrap_layer = config::ConfigLayer::merge_layers(&[
+        config::load_startup_config(beads_dir)?,
+        cli.as_layer(),
+    ]);
+
+    let (storage, import_result) = config::repair_database_from_jsonl(
+        beads_dir,
+        db_path,
+        jsonl_path,
+        cli.lock_timeout,
+        &bootstrap_layer,
+        show_progress,
+    )?;
+
+    let fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
+
+    if fk_violations > 0 {
+        tracing::warn!(
+            violations = fk_violations,
+            "FK violations found after repair import; cleaning orphans"
+        );
+        for table in &[
+            "dependencies",
+            "labels",
+            "comments",
+            "events",
+            "dirty_issues",
+            "export_hashes",
+            "blocked_issues_cache",
+            "child_counters",
+        ] {
+            let col = if *table == "child_counters" {
+                "parent_id"
+            } else {
+                "issue_id"
+            };
+            let cleanup = format!("DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)");
+            storage.execute_raw(&cleanup)?;
+        }
+
+        let remaining_fk_violations = storage.execute_raw_query("PRAGMA foreign_key_check")?.len();
+        if remaining_fk_violations > 0 {
+            return Err(BeadsError::Config(format!(
+                "Repair import finished with {remaining_fk_violations} foreign key violation(s) still present"
+            )));
+        }
+    }
+
+    Ok(DoctorRepairResult {
+        imported: import_result.imported_count,
+        skipped: import_result.skipped_count,
+        fk_violations_cleaned: fk_violations,
+    })
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -939,80 +1006,19 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             ctx.info("Repairing: rebuilding DB from JSONL...");
         }
 
-        // Remove the corrupt DB and its WAL/SHM files.
-        // We use string concatenation (not with_extension) to handle both
-        // extensioned paths (storage.sqlite3-wal) and bare paths (storage-wal).
-        let db_str = db_path.to_string_lossy().to_string();
-        for suffix in &["", "-wal", "-shm"] {
-            let p = PathBuf::from(format!("{db_str}{suffix}"));
-            if p.exists() && let Err(e) = fs::remove_file(&p) {
-                tracing::warn!(path = %p.display(), error = %e, "Failed to remove corrupt DB file");
-            }
-        }
-
-        // Open fresh storage (creates schema)
-        let mut storage = SqliteStorage::open(&db_path)?;
-
-        // Note: import_from_jsonl manages its own FK deferral internally
-        // (disables FKs before bulk insert, re-enables after, then cleans orphans)
-
-        // Import from JSONL
-        let import_config = ImportConfig {
-            force_upsert: true,
-            skip_prefix_validation: true,
-            clear_duplicate_external_refs: true,
-            orphan_mode: OrphanMode::Allow,
-            beads_dir: Some(beads_dir.clone()),
-            allow_external_jsonl: true,
-            show_progress: !ctx.is_json(),
-            rename_on_import: false,
-        };
-
-        match import_from_jsonl(&mut storage, jsonl_path, &import_config, None) {
+        match repair_database_from_jsonl(&beads_dir, &db_path, jsonl_path, cli, !ctx.is_json()) {
             Ok(result) => {
-                // Validate FK integrity after import
-                let fk_check = storage.execute_raw_query("PRAGMA foreign_key_check");
-                let fk_violations = fk_check.map_or(0, |rows| rows.len());
-
-                if fk_violations > 0 {
-                    tracing::warn!(
-                        violations = fk_violations,
-                        "FK violations found after repair import; cleaning orphans"
-                    );
-                    // Clean up orphaned rows in child tables
-                    for table in &[
-                        "dependencies",
-                        "labels",
-                        "comments",
-                        "events",
-                        "dirty_issues",
-                        "export_hashes",
-                        "blocked_issues_cache",
-                        "child_counters",
-                    ] {
-                        let col = if *table == "child_counters" {
-                            "parent_id"
-                        } else {
-                            "issue_id"
-                        };
-                        let cleanup = format!(
-                            "DELETE FROM {table} WHERE {col} NOT IN (SELECT id FROM issues)"
-                        );
-                        let _ = storage.execute_raw(&cleanup);
-                    }
-                }
-
                 if ctx.is_json() {
                     ctx.json(&serde_json::json!({
                         "repaired": true,
-                        "imported": result.imported_count,
-                        "skipped": result.skipped_count,
-                        "fk_violations_cleaned": fk_violations,
+                        "imported": result.imported,
+                        "skipped": result.skipped,
+                        "fk_violations_cleaned": result.fk_violations_cleaned,
                     }));
                 } else {
                     ctx.info(&format!(
                         "Repair complete: imported {}, skipped {}",
-                        result.imported_count, result.skipped_count
+                        result.imported, result.skipped
                     ));
                 }
             }
@@ -1034,8 +1040,12 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Issue, IssueType, Priority, Status};
+    use crate::storage::SqliteStorage;
+    use chrono::Utc;
     use fsqlite::Connection;
-    use tempfile::NamedTempFile;
+    use std::fs;
+    use tempfile::{NamedTempFile, TempDir};
 
     fn find_check<'a>(checks: &'a [CheckResult], name: &str) -> Option<&'a CheckResult> {
         checks.iter().find(|check| check.name == name)
@@ -1065,5 +1075,165 @@ mod tests {
 
         let tables = find_check(&checks, "schema.tables").expect("tables check");
         assert!(matches!(tables.status, CheckStatus::Error));
+    }
+
+    #[test]
+    fn test_repair_database_from_jsonl_restores_original_db_on_import_failure() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        {
+            let mut storage = SqliteStorage::open(&db_path).unwrap();
+            let issue = Issue {
+                id: "bd-keep".to_string(),
+                content_hash: None,
+                title: "Keep me".to_string(),
+                description: None,
+                design: None,
+                acceptance_criteria: None,
+                notes: None,
+                status: Status::Open,
+                priority: Priority::MEDIUM,
+                issue_type: IssueType::Task,
+                assignee: None,
+                owner: None,
+                estimated_minutes: None,
+                created_at: Utc::now(),
+                created_by: None,
+                updated_at: Utc::now(),
+                closed_at: None,
+                close_reason: None,
+                closed_by_session: None,
+                due_at: None,
+                defer_until: None,
+                external_ref: None,
+                source_system: None,
+                source_repo: None,
+                deleted_at: None,
+                deleted_by: None,
+                delete_reason: None,
+                original_type: None,
+                compaction_level: None,
+                compacted_at: None,
+                compacted_at_commit: None,
+                original_size: None,
+                sender: None,
+                ephemeral: false,
+                pinned: false,
+                is_template: false,
+                labels: Vec::new(),
+                dependencies: Vec::new(),
+                comments: Vec::new(),
+            };
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        fs::write(&jsonl_path, "not valid json\n").unwrap();
+
+        let err = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid JSON"),
+            "unexpected error: {err}"
+        );
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        let issue = reopened
+            .get_issue("bd-keep")
+            .unwrap()
+            .expect("original DB should be restored after failed repair");
+        assert_eq!(issue.title, "Keep me");
+
+        let recovery_dir = beads_dir.join(".br_recovery");
+        let backup_count =
+            fs::read_dir(&recovery_dir).map_or(0, |entries| entries.flatten().count());
+        assert_eq!(
+            backup_count, 0,
+            "preflight failures should not create recovery backups"
+        );
+    }
+
+    #[test]
+    fn test_repair_database_from_jsonl_restores_issue_prefix_from_jsonl() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let issue = Issue {
+            id: "proj-abc123".to_string(),
+            content_hash: None,
+            title: "Imported".to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type: IssueType::Task,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: Utc::now(),
+            created_by: None,
+            updated_at: Utc::now(),
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            comments: Vec::new(),
+        };
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let result = repair_database_from_jsonl(
+            &beads_dir,
+            &db_path,
+            &jsonl_path,
+            &config::CliOverrides::default(),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(result.imported, 1);
+
+        let reopened = SqliteStorage::open(&db_path).unwrap();
+        assert_eq!(
+            reopened.get_config("issue_prefix").unwrap().as_deref(),
+            Some("proj")
+        );
     }
 }

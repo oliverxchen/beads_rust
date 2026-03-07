@@ -214,10 +214,10 @@ fn resolve_target_ids(
         ids.push(last_touched);
     }
 
-    let resolved_ids = resolver.resolve_all(
+    let resolved_ids = resolver.resolve_all_fallible(
         &ids,
-        |id| storage.id_exists(id).unwrap_or(false),
-        |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
+        |id| storage.id_exists(id),
+        |hash| storage.find_ids_by_hash(hash),
     )?;
 
     Ok(resolved_ids.into_iter().map(|r| r.id).collect())
@@ -309,10 +309,10 @@ fn optional_date_field(value: Option<&str>) -> Result<Option<Option<DateTime<Utc
 
 fn resolve_issue_id(resolver: &IdResolver, storage: &SqliteStorage, input: &str) -> Result<String> {
     resolver
-        .resolve(
+        .resolve_fallible(
             input,
-            |id| storage.id_exists(id).unwrap_or(false),
-            |hash| storage.find_ids_by_hash(hash).unwrap_or_default(),
+            |id| storage.id_exists(id),
+            |hash| storage.find_ids_by_hash(hash),
         )
         .map(|resolved| resolved.id)
 }

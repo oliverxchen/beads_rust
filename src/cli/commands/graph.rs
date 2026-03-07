@@ -484,10 +484,10 @@ fn resolve_issue_id(
     input: &str,
 ) -> Result<String> {
     resolver
-        .resolve(
+        .resolve_fallible(
             input,
-            |id| storage.id_exists(id).unwrap_or(false),
-            |hash| find_matching_ids(all_ids, hash),
+            |id| storage.id_exists(id),
+            |hash| Ok(find_matching_ids(all_ids, hash)),
         )
         .map(|resolved| resolved.id)
 }

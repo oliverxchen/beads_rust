@@ -7,6 +7,7 @@ use crate::util::id::{IdGenerator, child_id};
 use crate::validation::LabelValidator;
 use chrono::Utc;
 use rich_rust::prelude::*;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 fn split_labels(values: &[String]) -> Vec<String> {
@@ -20,6 +21,12 @@ fn split_labels(values: &[String]) -> Vec<String> {
         }
     }
     labels
+}
+
+fn push_unique_label(labels: &mut Vec<String>, label: &str) {
+    if !labels.iter().any(|existing| existing == label) {
+        labels.push(label.to_string());
+    }
 }
 
 /// Execute the quick capture command.
@@ -86,8 +93,9 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
     } else {
         let id_gen = IdGenerator::new(id_config);
         let count = storage.count_issues()?;
+        let existing_ids: HashSet<String> = storage.get_all_ids()?.into_iter().collect();
         id_gen.generate(&title, None, None, now, count, |candidate| {
-            storage.id_exists(candidate).unwrap_or(false)
+            existing_ids.contains(candidate)
         })
     };
 
@@ -98,7 +106,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
             eprintln!("Warning: invalid label '{label}': {}", err.message);
             continue;
         }
-        valid_labels.push(label);
+        push_unique_label(&mut valid_labels, &label);
     }
 
     let mut issue = Issue {
@@ -203,4 +211,19 @@ fn render_quick_created_rich(id: &str, title: &str, ctx: &OutputContext) {
         .box_style(theme.box_style);
 
     console.print_renderable(&panel);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_unique_label_deduplicates_repeated_values() {
+        let mut labels = Vec::new();
+        push_unique_label(&mut labels, "backend");
+        push_unique_label(&mut labels, "backend");
+        push_unique_label(&mut labels, "ops");
+
+        assert_eq!(labels, vec!["backend".to_string(), "ops".to_string()]);
+    }
 }

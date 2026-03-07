@@ -351,7 +351,7 @@ fn populate_relations(issue: &mut Issue, args: &CreateArgs, actor: &str, now: Da
     // Labels
     for label in &args.labels {
         let label = label.trim();
-        if !label.is_empty() {
+        if !label.is_empty() && !issue.labels.iter().any(|existing| existing == label) {
             issue.labels.push(label.to_string());
         }
     }
@@ -565,7 +565,9 @@ fn execute_import(
                 );
                 continue;
             }
-            issue.labels.push(label);
+            if !issue.labels.iter().any(|existing| existing == &label) {
+                issue.labels.push(label);
+            }
         }
 
         // Populate Dependencies (with validation)
@@ -1097,5 +1099,25 @@ mod tests {
         let labels = storage.get_labels(&issue.id).expect("get labels");
         assert_eq!(labels, vec!["trimmed"]);
         info!("test_create_issue_trims_labels: assertions passed");
+    }
+
+    #[test]
+    fn test_create_issue_deduplicates_labels() {
+        init_test_logging();
+        info!("test_create_issue_deduplicates_labels: starting");
+        let mut storage = setup_memory_storage();
+        let config = default_config();
+        let mut args = default_args();
+        args.labels = vec![
+            "backend".to_string(),
+            "backend".to_string(),
+            "  backend  ".to_string(),
+        ];
+
+        let issue = create_issue_impl(&mut storage, &args, &config).expect("create failed");
+
+        let labels = storage.get_labels(&issue.id).expect("get labels");
+        assert_eq!(labels, vec!["backend"]);
+        info!("test_create_issue_deduplicates_labels: assertions passed");
     }
 }

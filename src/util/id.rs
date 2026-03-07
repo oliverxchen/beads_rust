@@ -675,6 +675,85 @@ impl IdResolver {
         })
     }
 
+    /// Resolve a partial ID while allowing the lookup callbacks to fail.
+    ///
+    /// This is the same algorithm as [`IdResolver::resolve`], but it preserves
+    /// storage/query errors instead of forcing callers to coerce them into
+    /// `false` or an empty match set.
+    ///
+    /// # Errors
+    ///
+    /// - Propagates any error returned by `exists_fn` or `substring_match_fn`
+    /// - `IssueNotFound` if no match is found
+    /// - `AmbiguousId` if multiple matches are found
+    pub fn resolve_fallible<F, G>(
+        &self,
+        input: &str,
+        exists_fn: F,
+        substring_match_fn: G,
+    ) -> Result<ResolvedId>
+    where
+        F: Fn(&str) -> Result<bool>,
+        G: Fn(&str) -> Result<Vec<String>>,
+    {
+        let input = input.trim();
+
+        if input.is_empty() {
+            return Err(BeadsError::InvalidId { id: String::new() });
+        }
+
+        let normalized = normalize_id(input);
+
+        if exists_fn(&normalized)? {
+            return Ok(ResolvedId {
+                id: normalized,
+                match_type: MatchType::Exact,
+                original_input: input.to_string(),
+            });
+        }
+
+        if !normalized.contains('-') {
+            let with_prefix = format!("{}-{}", self.config.default_prefix, normalized);
+            if exists_fn(&with_prefix)? {
+                return Ok(ResolvedId {
+                    id: with_prefix,
+                    match_type: MatchType::PrefixNormalized,
+                    original_input: input.to_string(),
+                });
+            }
+        }
+
+        if self.config.allow_substring_match {
+            let hash_pattern = split_prefix_remainder(&normalized)
+                .map_or(normalized.as_str(), |(_, remainder)| remainder);
+
+            if !hash_pattern.is_empty() {
+                let matches = substring_match_fn(hash_pattern)?;
+
+                match matches.len() {
+                    0 => {}
+                    1 => {
+                        return Ok(ResolvedId {
+                            id: matches.into_iter().next().unwrap_or_default(),
+                            match_type: MatchType::Substring,
+                            original_input: input.to_string(),
+                        });
+                    }
+                    _ => {
+                        return Err(BeadsError::AmbiguousId {
+                            partial: input.to_string(),
+                            matches,
+                        });
+                    }
+                }
+            }
+        }
+
+        Err(BeadsError::IssueNotFound {
+            id: input.to_string(),
+        })
+    }
+
     /// Resolve multiple IDs, returning results for each.
     ///
     /// If any ID fails to resolve, returns the first error.
@@ -696,6 +775,27 @@ impl IdResolver {
         inputs
             .iter()
             .map(|input| self.resolve(input, &exists_fn, &substring_match_fn))
+            .collect()
+    }
+
+    /// Resolve multiple IDs while preserving lookup callback errors.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first callback or resolution error encountered.
+    pub fn resolve_all_fallible<F, G>(
+        &self,
+        inputs: &[String],
+        exists_fn: F,
+        substring_match_fn: G,
+    ) -> Result<Vec<ResolvedId>>
+    where
+        F: Fn(&str) -> Result<bool>,
+        G: Fn(&str) -> Result<Vec<String>>,
+    {
+        inputs
+            .iter()
+            .map(|input| self.resolve_fallible(input, &exists_fn, &substring_match_fn))
             .collect()
     }
 }
@@ -736,6 +836,22 @@ where
     let resolver = IdResolver::with_defaults();
     resolver
         .resolve(input, exists_fn, substring_match_fn)
+        .map(|r| r.id)
+}
+
+/// Quick helper to resolve a single ID with fallible lookup callbacks.
+///
+/// # Errors
+///
+/// Propagates any lookup error in addition to the usual resolution errors.
+pub fn resolve_id_fallible<F, G>(input: &str, exists_fn: F, substring_match_fn: G) -> Result<String>
+where
+    F: Fn(&str) -> Result<bool>,
+    G: Fn(&str) -> Result<Vec<String>>,
+{
+    let resolver = IdResolver::with_defaults();
+    resolver
+        .resolve_fallible(input, exists_fn, substring_match_fn)
         .map(|r| r.id)
 }
 
@@ -868,6 +984,31 @@ mod tests {
             .resolve("  bd-abc123  ", exists_in_mock, substring_in_mock)
             .unwrap();
         assert_eq!(result.id, "bd-abc123");
+    }
+
+    #[test]
+    fn test_resolve_fallible_propagates_lookup_error() {
+        let resolver = IdResolver::with_defaults();
+        let result = resolver.resolve_fallible(
+            "bd-abc123",
+            |_id| Err(BeadsError::Config("lookup failed".to_string())),
+            |_hash| Ok(Vec::new()),
+        );
+        assert!(matches!(result, Err(BeadsError::Config(message)) if message == "lookup failed"));
+    }
+
+    #[test]
+    fn test_resolve_all_fallible_propagates_lookup_error() {
+        let resolver = IdResolver::with_defaults();
+        let inputs = vec!["bd-abc123".to_string(), "bd-xyz789".to_string()];
+        let result = resolver.resolve_all_fallible(
+            &inputs,
+            |_id| Err(BeadsError::Config("exists lookup failed".to_string())),
+            |_hash| Ok(Vec::new()),
+        );
+        assert!(
+            matches!(result, Err(BeadsError::Config(message)) if message == "exists lookup failed")
+        );
     }
 
     #[test]
